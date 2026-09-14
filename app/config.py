@@ -28,6 +28,11 @@ class Settings(BaseSettings):
     claim_cooldown_minutes: int = 30
     claim_timeout_hours: int = 48
 
+    # Chat — unlocks on AI match (50%+ allows text/category/location match even without claimant photo)
+    chat_min_confidence: int = 50
+    chat_max_messages_per_minute: int = 20
+    chat_message_max_length: int = 1000
+
     @property
     def allowed_origins_list(self) -> list[str]:
         return [o.strip() for o in self.allowed_origins.split(",") if o.strip()]

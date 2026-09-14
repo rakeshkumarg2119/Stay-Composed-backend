@@ -18,7 +18,7 @@ def _text_blob(title: str, description: str) -> str:
     return f"{title}. {description}".strip()
 
 
-def _to_out(doc: dict) -> ItemOut:
+def _to_out(doc: dict, include_secrets: bool = False) -> ItemOut:
     return ItemOut(
         id=doc["_id"],
         type=doc["type"],
@@ -28,6 +28,7 @@ def _to_out(doc: dict) -> ItemOut:
         date=doc.get("date"),
         description=doc["description"],
         imageUrl=doc.get("imageUrl"),
+        secretFeatures=doc.get("secretFeatures") if include_secrets else None,
         challengeQuestions=doc.get("challengeQuestions"),
         reportedBy=doc["reportedBy"],
         status=doc.get("status", "open"),
@@ -82,13 +83,17 @@ async def create_item(payload: ItemCreate):
     }
 
     if payload.type == "lost":
-        doc["secretFeatureHashes"] = [hash_secret(f) for f in payload.secretFeatures if f.strip()]
+        clean_features = [f.strip() for f in (payload.secretFeatures or []) if f.strip()]
+        doc["secretFeatures"] = clean_features
+        doc["secretFeatureHashes"] = [hash_secret(f) for f in clean_features]
     else:
-        doc["challengeQuestions"] = [q.strip() for q in payload.challengeQuestions]
-        doc["secretAnswerHashes"] = [hash_secret(a) for a in payload.secretAnswers]
+        clean_questions = [q.strip() for q in (payload.challengeQuestions or []) if q.strip()]
+        clean_answers = [a.strip() for a in (payload.secretAnswers or []) if a.strip()]
+        doc["challengeQuestions"] = clean_questions
+        doc["secretAnswerHashes"] = [hash_secret(a) for a in clean_answers]
 
     await items_collection().insert_one(doc)
-    return _to_out(doc)
+    return _to_out(doc, include_secrets=True)
 
 
 def _safe_list(vec):
@@ -109,6 +114,8 @@ async def my_items(email: str = Query(...)):
         import numpy as np
 
         for lost in my_complaints_docs:
+            if lost.get("status") in ("handed_over", "resolved"):
+                continue
             lost_scored = {
                 "category": lost.get("category"),
                 "location": lost.get("location"),
@@ -125,13 +132,13 @@ async def my_items(email: str = Query(...)):
                 confidence = score_pair(lost_scored, found_scored)
                 if confidence >= settings.match_min_confidence:
                     candidate_matches.append(
-                        CandidateMatch(candidate=_to_out(found), forComplaintId=lost["_id"], confidence=confidence)
+                        CandidateMatch(candidate=_to_out(found, include_secrets=False), forComplaintId=lost["_id"], confidence=confidence)
                     )
 
     candidate_matches.sort(key=lambda m: m.confidence, reverse=True)
 
     return MineResponse(
-        myComplaints=[_to_out(d) for d in my_complaints_docs],
-        myFoundItems=[_to_out(d) for d in my_found_docs],
+        myComplaints=[_to_out(d, include_secrets=True) for d in my_complaints_docs],
+        myFoundItems=[_to_out(d, include_secrets=True) for d in my_found_docs],
         candidateMatches=candidate_matches,
     )

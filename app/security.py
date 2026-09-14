@@ -31,3 +31,18 @@ def mask_display_name(full_name: str | None, email: str | None) -> str:
         local = email.split("@")[0]
         return f"Campus Member {local[:3].upper()}***"
     return "Campus Member"
+
+
+_TAG_RE = re.compile(r"<[^>]*>")
+
+
+def sanitize_chat_text(text: str, max_length: int = 1000) -> str:
+    """
+    Basic (not end-to-end encrypted) message hygiene: strip any HTML/script tags
+    so a message can't inject markup into the other person's chat view, collapse
+    whitespace, and hard-cap length. Transport security (TLS) + auth checks on
+    the endpoints are what actually protect the message in transit/at rest.
+    """
+    stripped = _TAG_RE.sub("", text)
+    collapsed = re.sub(r"\s+", " ", stripped).strip()
+    return collapsed[:max_length]

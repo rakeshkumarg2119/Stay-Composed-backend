@@ -1,12 +1,29 @@
 from datetime import datetime, timezone
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Query
 
 from app.database import blood_alerts_collection, staff_collection
 from app.models import BloodAlertRequest, BloodAlertResult
 from app.services.email_service import send_blood_alert
 
 router = APIRouter(prefix="/blood-alert", tags=["blood-alert"])
+
+
+@router.get("/mine")
+async def my_blood_alerts(email: str = Query(...)):
+    docs = [
+        {
+            "id": str(d["_id"]),
+            "studentName": d.get("studentName"),
+            "bloodType": d.get("bloodType"),
+            "phoneNumber": d.get("phoneNumber"),
+            "senderEmail": d.get("senderEmail"),
+            "recipientsNotified": d.get("recipientsNotified", 0),
+            "createdAt": d.get("createdAt").isoformat() if d.get("createdAt") else None,
+        }
+        async for d in blood_alerts_collection().find({"senderEmail": email}).sort("createdAt", -1)
+    ]
+    return docs
 
 
 @router.post("", response_model=BloodAlertResult)

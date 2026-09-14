@@ -38,9 +38,10 @@ class ItemOut(BaseModel):
     date: Optional[str] = None
     description: str
     imageUrl: Optional[str] = None
+    secretFeatures: Optional[list[str]] = None  # Returned only to the reporter on /mine
     challengeQuestions: Optional[list[str]] = None  # safe to expose (questions only, not answers)
     reportedBy: str
-    status: Literal["open", "matched", "verified", "resolved", "expired"]
+    status: Literal["open", "matched", "verified", "handed_over", "resolved", "expired"]
     createdAt: datetime
 
 
@@ -90,3 +91,41 @@ class BloodAlertResult(BaseModel):
     success: bool
     recipientsNotified: int
     message: str
+
+
+# ---------------------------------------------------------------------------
+# Chat — only unlocked between a claimant and founder once the AI match
+# confidence crosses chat_min_confidence ("exact requirement" match). Free
+# text both ways, but closes permanently once the founder starts verification.
+# ---------------------------------------------------------------------------
+
+class ChatThreadOut(BaseModel):
+    threadId: str
+    complaintId: str
+    foundItemId: str
+    claimantEmail: EmailStr
+    founderEmail: EmailStr
+    confidence: int
+    status: Literal["chat", "verifying", "verified", "handed_over", "resolved", "closed"]
+    createdAt: datetime
+    verificationStartedAt: Optional[datetime] = None
+    handedOverAt: Optional[datetime] = None
+
+
+class ChatThreadRequest(BaseModel):
+    complaintId: str
+    foundItemId: str
+    requesterEmail: EmailStr
+
+
+class ChatMessageIn(BaseModel):
+    senderEmail: EmailStr
+    text: str = Field(min_length=1, max_length=1000)
+
+
+class ChatMessageOut(BaseModel):
+    id: str
+    threadId: str
+    senderEmail: EmailStr
+    text: str
+    sentAt: datetime

@@ -1,0 +1,260 @@
+import uuid
+from datetime import datetime, timedelta, timezone
+
+import numpy as np
+from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketDisconnect
+
+from app.config import get_settings
+from app.database import chat_messages_collection, chat_threads_collection, items_collection
+from app.models import ChatMessageOut, ChatThreadOut, ChatThreadRequest
+from app.security import sanitize_chat_text
+from app.services.matching import score_pair
+
+router = APIRouter(prefix="/chat", tags=["chat"])
+
+
+# ---------------------------------------------------------------------------
+# In-memory WebSocket registry (per-process). Fine for a single backend
+# instance; a multi-instance deploy would need a shared pub/sub (e.g. Redis)
+# instead of this dict.
+# ---------------------------------------------------------------------------
+class ConnectionManager:
+    def __init__(self) -> None:
+        self._threads: dict[str, list[WebSocket]] = {}
+
+    async def connect(self, thread_id: str, ws: WebSocket) -> None:
+        await ws.accept()
+        self._threads.setdefault(thread_id, []).append(ws)
+
+    def disconnect(self, thread_id: str, ws: WebSocket) -> None:
+        conns = self._threads.get(thread_id, [])
+        if ws in conns:
+            conns.remove(ws)
+        if not conns and thread_id in self._threads:
+            del self._threads[thread_id]
+
+    async def broadcast(self, thread_id: str, payload: dict) -> None:
+        for ws in list(self._threads.get(thread_id, [])):
+            try:
+                await ws.send_json(payload)
+            except Exception:
+                self.disconnect(thread_id, ws)
+
+
+manager = ConnectionManager()
+
+
+def _thread_id(complaint_id: str, found_item_id: str) -> str:
+    return f"{complaint_id}:{found_item_id}"
+
+
+def _msg_out(doc: dict) -> ChatMessageOut:
+    return ChatMessageOut(
+        id=doc["_id"],
+        threadId=doc["threadId"],
+        senderEmail=doc["senderEmail"],
+        text=doc["text"],
+        sentAt=doc["sentAt"],
+    )
+
+
+async def _get_thread_or_404(thread_id: str) -> dict:
+    thread = await chat_threads_collection().find_one({"_id": thread_id})
+    if not thread:
+        raise HTTPException(status_code=404, detail="Chat thread not found.")
+    return thread
+
+
+def _require_participant(thread: dict, email: str) -> None:
+    if email not in (thread["claimantEmail"], thread["founderEmail"]):
+        raise HTTPException(status_code=403, detail="You are not part of this chat.")
+
+
+@router.post("/thread", response_model=ChatThreadOut)
+async def get_or_create_thread(payload: ChatThreadRequest):
+    """
+    Only ever creates/returns a thread when the AI match confidence between
+    this specific lost complaint and found item is >= chat_min_confidence —
+    the "exact requirement match" gate. Below that, no thread, no chat.
+    """
+    settings = get_settings()
+    coll = items_collection()
+
+    complaint = await coll.find_one({"_id": payload.complaintId, "type": "lost"})
+    if not complaint:
+        raise HTTPException(status_code=404, detail="Lost complaint not found.")
+    found = await coll.find_one({"_id": payload.foundItemId, "type": "found"})
+    if not found:
+        raise HTTPException(status_code=404, detail="Found item not found.")
+
+    claimant_email = complaint["reporterEmail"]
+    founder_email = found["reporterEmail"]
+    if payload.requesterEmail not in (claimant_email, founder_email):
+        raise HTTPException(status_code=403, detail="You are not associated with either report.")
+
+    thread_id = _thread_id(payload.complaintId, payload.foundItemId)
+    existing = await chat_threads_collection().find_one({"_id": thread_id})
+    if existing:
+        return ChatThreadOut(threadId=thread_id, **{k: v for k, v in existing.items() if k != "_id"})
+
+    lost_vecs = {
+        "category": complaint.get("category"),
+        "location": complaint.get("location"),
+        "_textEmbedding": np.array(complaint["textEmbedding"]) if complaint.get("textEmbedding") else None,
+        "_imageEmbedding": np.array(complaint["imageEmbedding"]) if complaint.get("imageEmbedding") else None,
+    }
+    found_vecs = {
+        "category": found.get("category"),
+        "location": found.get("location"),
+        "_textEmbedding": np.array(found["textEmbedding"]) if found.get("textEmbedding") else None,
+        "_imageEmbedding": np.array(found["imageEmbedding"]) if found.get("imageEmbedding") else None,
+    }
+    confidence = score_pair(lost_vecs, found_vecs)
+
+    if confidence < settings.chat_min_confidence:
+        raise HTTPException(
+            status_code=403,
+            detail=f"AI match confidence ({confidence}) hasn't reached the chat threshold "
+                   f"({settings.chat_min_confidence}) yet.",
+        )
+
+    now = datetime.now(timezone.utc)
+    doc = {
+        "_id": thread_id,
+        "complaintId": payload.complaintId,
+        "foundItemId": payload.foundItemId,
+        "claimantEmail": claimant_email,
+        "founderEmail": founder_email,
+        "confidence": confidence,
+        "status": "chat",
+        "createdAt": now,
+        "verificationStartedAt": None,
+    }
+    await chat_threads_collection().insert_one(doc)
+    return ChatThreadOut(threadId=thread_id, **{k: v for k, v in doc.items() if k != "_id"})
+
+
+@router.get("/{thread_id}/messages", response_model=list[ChatMessageOut])
+async def list_messages(thread_id: str, email: str = Query(...)):
+    thread = await _get_thread_or_404(thread_id)
+    _require_participant(thread, email)
+    docs = [d async for d in chat_messages_collection().find({"threadId": thread_id}).sort("sentAt", 1)]
+    return [_msg_out(d) for d in docs]
+
+
+@router.get("/my-threads", response_model=list[ChatThreadOut])
+async def my_threads(email: str = Query(...)):
+    """
+    All chat threads this email is part of, either side — this is how a
+    founder discovers that a claimant hit the 85%+ gate and opened a chat on
+    one of their found items (the founder gets no other notification of it).
+    """
+    docs = [
+        d
+        async for d in chat_threads_collection()
+        .find({"$or": [{"claimantEmail": email}, {"founderEmail": email}]})
+        .sort("createdAt", -1)
+    ]
+    return [ChatThreadOut(threadId=d["_id"], **{k: v for k, v in d.items() if k != "_id"}) for d in docs]
+
+
+@router.post("/{thread_id}/start-verification", response_model=ChatThreadOut)
+async def start_verification(thread_id: str, founder_email: str = Query(...)):
+    """
+    Founder-only. Locks the chat permanently and hands off to the existing
+    hashed challenge-question claim flow (POST /claims) — chat does not
+    reopen after this, matching the "structured verification only" rule.
+    """
+    thread = await _get_thread_or_404(thread_id)
+    if founder_email != thread["founderEmail"]:
+        raise HTTPException(status_code=403, detail="Only the founder who reported this item can start verification.")
+    if thread["status"] != "chat":
+        raise HTTPException(status_code=409, detail=f"Thread is already '{thread['status']}', can't start verification again.")
+
+    now = datetime.now(timezone.utc)
+    await chat_threads_collection().update_one(
+        {"_id": thread_id},
+        {"$set": {"status": "verifying", "verificationStartedAt": now}},
+    )
+    await manager.broadcast(thread_id, {"type": "verification_started", "startedAt": now.isoformat()})
+
+    updated = await chat_threads_collection().find_one({"_id": thread_id})
+    return ChatThreadOut(threadId=thread_id, **{k: v for k, v in updated.items() if k != "_id"})
+
+
+@router.post("/{thread_id}/complete-handover", response_model=ChatThreadOut)
+async def complete_handover(thread_id: str, email: str = Query(...)):
+    """
+    Called by either the founder or claimant once physical handover is complete.
+    Permanently marks items as handed_over and closes the chat thread.
+    """
+    thread = await _get_thread_or_404(thread_id)
+    _require_participant(thread, email)
+    if thread.get("status") in ("handed_over", "closed"):
+        raise HTTPException(status_code=400, detail="Handover is already completed.")
+
+    now = datetime.now(timezone.utc)
+    await chat_threads_collection().update_one(
+        {"_id": thread_id},
+        {"$set": {"status": "handed_over", "handedOverAt": now, "handedOverBy": email}},
+    )
+    await items_collection().update_one(
+        {"_id": thread["foundItemId"]},
+        {"$set": {"status": "handed_over", "handedOverAt": now}},
+    )
+    await items_collection().update_one(
+        {"_id": thread["complaintId"]},
+        {"$set": {"status": "handed_over", "handedOverAt": now}},
+    )
+    await manager.broadcast(thread_id, {
+        "type": "handover_completed",
+        "completedBy": email,
+        "handedOverAt": now.isoformat(),
+    })
+
+    updated = await chat_threads_collection().find_one({"_id": thread_id})
+    return ChatThreadOut(threadId=thread_id, **{k: v for k, v in updated.items() if k != "_id"})
+
+
+@router.websocket("/ws/{thread_id}")
+async def chat_ws(websocket: WebSocket, thread_id: str, email: str = Query(...)):
+    settings = get_settings()
+    thread = await chat_threads_collection().find_one({"_id": thread_id})
+    if not thread or email not in (thread["claimantEmail"], thread["founderEmail"]):
+        await websocket.close(code=4403)
+        return
+
+    await manager.connect(thread_id, websocket)
+    try:
+        while True:
+            data = await websocket.receive_json()
+            text = sanitize_chat_text(str(data.get("text", "")), settings.chat_message_max_length)
+            if not text:
+                continue
+
+            current = await chat_threads_collection().find_one({"_id": thread_id})
+            if not current or current["status"] in ("handed_over", "closed"):
+                await websocket.send_json({"type": "error", "message": "This chat is closed — item handover has been completed."})
+                continue
+
+            # Basic abuse guard: cap messages per sender per minute (not E2E crypto,
+            # just a floor against spam/flooding on an authenticated, sanitized channel)
+            window_start = datetime.now(timezone.utc) - timedelta(minutes=1)
+            recent = await chat_messages_collection().count_documents(
+                {"threadId": thread_id, "senderEmail": email, "sentAt": {"$gte": window_start}}
+            )
+            if recent >= settings.chat_max_messages_per_minute:
+                await websocket.send_json({"type": "error", "message": "Slow down — too many messages, try again shortly."})
+                continue
+
+            msg_doc = {
+                "_id": f"msg-{uuid.uuid4().hex[:12]}",
+                "threadId": thread_id,
+                "senderEmail": email,
+                "text": text,
+                "sentAt": datetime.now(timezone.utc),
+            }
+            await chat_messages_collection().insert_one(msg_doc)
+            await manager.broadcast(thread_id, {"type": "message", **{k: v for k, v in msg_doc.items() if k != "_id"}, "id": msg_doc["_id"], "sentAt": msg_doc["sentAt"].isoformat()})
+    except WebSocketDisconnect:
+        manager.disconnect(thread_id, websocket)

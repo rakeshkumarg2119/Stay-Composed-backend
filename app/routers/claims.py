@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, HTTPException
 
 from app.config import get_settings
-from app.database import claims_collection, items_collection
+from app.database import chat_threads_collection, claims_collection, items_collection
 from app.models import ClaimRequest, ClaimResult
 from app.security import verify_secret
 
@@ -45,6 +45,18 @@ async def submit_claim(payload: ClaimRequest):
     if found.get("status") not in ("open", "matched"):
         raise HTTPException(status_code=409, detail="This item is no longer available to claim.")
 
+    # If this pair hit the high-confidence chat gate, a thread exists — in that
+    # case the founder must have explicitly started verification (locking the
+    # chat) before a claim can be submitted. Pairs that never reached chat
+    # (no thread) keep the original direct-claim path.
+    thread_id = f"{payload.complaintId}:{payload.foundItemId}"
+    thread = await chat_threads_collection().find_one({"_id": thread_id})
+    if thread and thread["status"] not in ("verifying", "resolved"):
+        raise HTTPException(
+            status_code=409,
+            detail="The founder hasn't started verification yet — wait for them to begin it from the chat.",
+        )
+
     stored_hashes: list[str] = found.get("secretAnswerHashes", [])
     total_fields = len(stored_hashes)
     if total_fields == 0:
@@ -72,10 +84,15 @@ async def submit_claim(payload: ClaimRequest):
     )
 
     if verified:
-        # Chat closes permanently once verification succeeds — mark both sides resolved
-        await items_collection().update_one({"_id": found["_id"]}, {"$set": {"status": "resolved"}})
-        await items_collection().update_one({"_id": complaint["_id"]}, {"$set": {"status": "resolved"}})
-        message = "Ownership verified! Majority of the secret details matched. This claim is now closed."
+        # Mark both items as verified (removes found item from any other candidate recommendations)
+        # Keep chat thread in 'verified' status so parties can coordinate meeting for physical handover
+        await items_collection().update_one({"_id": found["_id"]}, {"$set": {"status": "verified"}})
+        await items_collection().update_one({"_id": complaint["_id"]}, {"$set": {"status": "verified"}})
+        if thread:
+            await chat_threads_collection().update_one({"_id": thread_id}, {"$set": {"status": "verified"}})
+            from app.routers.chat import manager
+            await manager.broadcast(thread_id, {"type": "verification_completed", "verified": True})
+        message = "Ownership verified! Majority of the secret details matched. You can now coordinate meeting for handover in the chat."
     else:
         message = f"Verification failed — only {matched} of {total_fields} secret detail(s) matched. Try again or contact admin support."
 
