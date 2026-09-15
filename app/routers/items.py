@@ -142,4 +142,5 @@ async def my_items(email: str = Query(...)):
         myComplaints=[_to_out(d, include_secrets=True) for d in my_complaints_docs],
         myFoundItems=[_to_out(d, include_secrets=True) for d in my_found_docs],
         candidateMatches=candidate_matches,
+        chatConfidenceThreshold=settings.chat_min_confidence,
     )

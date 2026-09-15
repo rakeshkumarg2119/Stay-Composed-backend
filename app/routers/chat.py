@@ -9,8 +9,13 @@ from app.database import chat_messages_collection, chat_threads_collection, item
 from app.models import ChatMessageOut, ChatThreadOut, ChatThreadRequest
 from app.security import sanitize_chat_text
 from app.services.matching import score_pair
+from app.services.moderation import TIER_RESPONSES, classify_message
 
 router = APIRouter(prefix="/chat", tags=["chat"])
+
+# Consecutive "held" messages from the same sender before the whole
+# conversation gets auto-frozen and routed to admin review.
+HELD_ESCALATION_THRESHOLD = 3
 
 
 # ---------------------------------------------------------------------------
@@ -42,6 +47,15 @@ class ConnectionManager:
 
 
 manager = ConnectionManager()
+
+PRE_VERIFICATION_MESSAGES = frozenset(
+    {
+        "Where exactly did you find it?",
+        "Can you describe the item?",
+        "What time did you find it?",
+        "Can you share a safe public meeting point?",
+    }
+)
 
 
 def _thread_id(complaint_id: str, found_item_id: str) -> str:
@@ -129,6 +143,7 @@ async def get_or_create_thread(payload: ChatThreadRequest):
         "status": "chat",
         "createdAt": now,
         "verificationStartedAt": None,
+        "heldMessageCount": 0,
     }
     await chat_threads_collection().insert_one(doc)
     return ChatThreadOut(threadId=thread_id, **{k: v for k, v in doc.items() if k != "_id"})
@@ -176,6 +191,10 @@ async def start_verification(thread_id: str, founder_email: str = Query(...)):
         {"_id": thread_id},
         {"$set": {"status": "verifying", "verificationStartedAt": now}},
     )
+    await manager.broadcast(
+        thread_id,
+        {"event": "phase_changed", "status": "verification_pending"},
+    )
     await manager.broadcast(thread_id, {"type": "verification_started", "startedAt": now.isoformat()})
 
     updated = await chat_threads_collection().find_one({"_id": thread_id})
@@ -207,6 +226,10 @@ async def complete_handover(thread_id: str, email: str = Query(...)):
         {"$set": {"status": "resolved", "handedOverAt": now}},
     )
     await manager.broadcast(thread_id, {
+        "event": "phase_changed",
+        "status": "handed_over",
+    })
+    await manager.broadcast(thread_id, {
         "type": "handover_completed",
         "completedBy": email,
         "handedOverAt": now.isoformat(),
@@ -237,6 +260,34 @@ async def chat_ws(websocket: WebSocket, thread_id: str, email: str = Query(...))
                 await websocket.send_json({"type": "error", "message": "This chat is closed — item handover has been completed."})
                 continue
 
+            if current["status"] == "frozen":
+                await websocket.send_json(
+                    {"type": "error", "message": "This conversation has been frozen and is under admin review."}
+                )
+                continue
+
+            if current["status"] == "verifying":
+                await websocket.send_json(
+                    {"type": "error", "message": "Chat is locked while ownership verification is pending."}
+                )
+                continue
+
+            if current["status"] == "chat" and text not in PRE_VERIFICATION_MESSAGES:
+                await websocket.send_json(
+                    {
+                        "type": "error",
+                        "message": "Before verification, choose one of the allowed question messages.",
+                        "allowedMessages": sorted(PRE_VERIFICATION_MESSAGES),
+                    }
+                )
+                continue
+
+            if current["status"] not in ("chat", "verified"):
+                await websocket.send_json(
+                    {"type": "error", "message": "Messages are not allowed in the current chat phase."}
+                )
+                continue
+
             # Basic abuse guard: cap messages per sender per minute (not E2E crypto,
             # just a floor against spam/flooding on an authenticated, sanitized channel)
             window_start = datetime.now(timezone.utc) - timedelta(minutes=1)
@@ -245,6 +296,49 @@ async def chat_ws(websocket: WebSocket, thread_id: str, email: str = Query(...))
             )
             if recent >= settings.chat_max_messages_per_minute:
                 await websocket.send_json({"type": "error", "message": "Slow down — too many messages, try again shortly."})
+                continue
+
+            # ------------------------------------------------------------------
+            # Tone/abuse moderation — see app/services/moderation.py for the
+            # tiered contract. Runs after the phase/rate checks above so we
+            # only moderate messages that were otherwise going to be sent.
+            # ------------------------------------------------------------------
+            tier = classify_message(text)
+
+            if tier == "frozen":
+                await chat_threads_collection().update_one(
+                    {"_id": thread_id}, {"$set": {"status": "frozen", "frozenAt": datetime.now(timezone.utc)}}
+                )
+                await manager.broadcast(thread_id, {"event": "phase_changed", "status": "frozen"})
+                await manager.broadcast(
+                    thread_id,
+                    {"type": "conversation_frozen", "message": TIER_RESPONSES["frozen"]},
+                )
+                continue
+
+            if tier == "held":
+                new_count = current.get("heldMessageCount", 0) + 1
+                update = {"$set": {"heldMessageCount": new_count}}
+                await chat_threads_collection().update_one({"_id": thread_id}, update)
+
+                if new_count >= HELD_ESCALATION_THRESHOLD:
+                    await chat_threads_collection().update_one(
+                        {"_id": thread_id}, {"$set": {"status": "frozen", "frozenAt": datetime.now(timezone.utc)}}
+                    )
+                    await manager.broadcast(thread_id, {"event": "phase_changed", "status": "frozen"})
+                    await manager.broadcast(
+                        thread_id,
+                        {"type": "conversation_frozen", "message": TIER_RESPONSES["frozen"]},
+                    )
+                else:
+                    await websocket.send_json(
+                        {
+                            "type": "moderation_notice",
+                            "tier": "held",
+                            "message": TIER_RESPONSES["held"],
+                            "heldMessageCount": new_count,
+                        }
+                    )
                 continue
 
             msg_doc = {
@@ -256,5 +350,10 @@ async def chat_ws(websocket: WebSocket, thread_id: str, email: str = Query(...))
             }
             await chat_messages_collection().insert_one(msg_doc)
             await manager.broadcast(thread_id, {"type": "message", **{k: v for k, v in msg_doc.items() if k != "_id"}, "id": msg_doc["_id"], "sentAt": msg_doc["sentAt"].isoformat()})
+
+            if tier == "nudge":
+                await websocket.send_json(
+                    {"type": "moderation_notice", "tier": "nudge", "message": TIER_RESPONSES["nudge"]}
+                )
     except WebSocketDisconnect:
         manager.disconnect(thread_id, websocket)

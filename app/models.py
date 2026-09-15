@@ -55,6 +55,7 @@ class MineResponse(BaseModel):
     myComplaints: list[ItemOut]
     myFoundItems: list[ItemOut]
     candidateMatches: list[CandidateMatch]
+    chatConfidenceThreshold: int
 
 
 # ---------------------------------------------------------------------------
@@ -106,10 +107,11 @@ class ChatThreadOut(BaseModel):
     claimantEmail: EmailStr
     founderEmail: EmailStr
     confidence: int
-    status: Literal["chat", "verifying", "verified", "handed_over", "resolved", "closed"]
+    status: Literal["chat", "verifying", "verified", "handed_over", "resolved", "closed", "frozen"]
     createdAt: datetime
     verificationStartedAt: Optional[datetime] = None
     handedOverAt: Optional[datetime] = None
+    heldMessageCount: int = 0
 
 
 class ChatThreadRequest(BaseModel):

@@ -120,6 +120,7 @@ async def submit_claim(payload: ClaimRequest):
         if thread:
             await chat_threads_collection().update_one({"_id": thread_id}, {"$set": {"status": "verified"}})
             from app.routers.chat import manager
+            await manager.broadcast(thread_id, {"event": "phase_changed", "status": "verified"})
             await manager.broadcast(thread_id, {"type": "verification_completed", "verified": True})
         
         detail_note = " (including AI semantic verification)" if semantic_matches > 0 else ""
