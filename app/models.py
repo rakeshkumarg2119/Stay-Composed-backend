@@ -106,6 +106,8 @@ class ChatThreadOut(BaseModel):
     foundItemId: str
     claimantEmail: EmailStr
     founderEmail: EmailStr
+    claimantName: Optional[str] = None
+    founderName: Optional[str] = None
     confidence: int
     status: Literal["chat", "verifying", "verified", "handed_over", "resolved", "closed", "frozen"]
     createdAt: datetime

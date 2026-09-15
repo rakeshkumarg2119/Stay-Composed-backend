@@ -25,21 +25,50 @@ HELD_ESCALATION_THRESHOLD = 3
 # ---------------------------------------------------------------------------
 class ConnectionManager:
     def __init__(self) -> None:
-        self._threads: dict[str, list[WebSocket]] = {}
+        self._threads: dict[str, list[tuple[WebSocket, str]]] = {}
 
-    async def connect(self, thread_id: str, ws: WebSocket) -> None:
+    async def connect(self, thread_id: str, ws: WebSocket, email: str) -> None:
         await ws.accept()
-        self._threads.setdefault(thread_id, []).append(ws)
+        self._threads.setdefault(thread_id, []).append((ws, email))
+        online_emails = self.get_online_emails(thread_id)
+        # Send initial presence frame to newly connected socket
+        try:
+            await ws.send_json({
+                "type": "presence",
+                "onlineEmails": online_emails,
+                "userEmail": email,
+                "status": "online",
+            })
+        except Exception:
+            pass
+        # Broadcast presence to thread participants
+        await self.broadcast(thread_id, {
+            "type": "presence",
+            "onlineEmails": online_emails,
+            "userEmail": email,
+            "status": "online",
+        })
 
-    def disconnect(self, thread_id: str, ws: WebSocket) -> None:
+    def disconnect(self, thread_id: str, ws: WebSocket) -> str | None:
         conns = self._threads.get(thread_id, [])
-        if ws in conns:
-            conns.remove(ws)
-        if not conns and thread_id in self._threads:
+        disconnected_email = None
+        remaining = []
+        for sock, email in conns:
+            if sock == ws:
+                disconnected_email = email
+            else:
+                remaining.append((sock, email))
+        if remaining:
+            self._threads[thread_id] = remaining
+        elif thread_id in self._threads:
             del self._threads[thread_id]
+        return disconnected_email
+
+    def get_online_emails(self, thread_id: str) -> list[str]:
+        return list({email for _, email in self._threads.get(thread_id, [])})
 
     async def broadcast(self, thread_id: str, payload: dict) -> None:
-        for ws in list(self._threads.get(thread_id, [])):
+        for ws, _ in list(self._threads.get(thread_id, [])):
             try:
                 await ws.send_json(payload)
             except Exception:
@@ -48,13 +77,48 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
+# Pre-verification template messages tailored for both Finder and Loster (Claimant)
+# Both questions and answers are allowlisted so parties can converse safely
+# before secret challenge verification is completed.
+PRE_VERIFICATION_QUESTIONS_LOSTER = [
+    "Where exactly did you find it?",
+    "What time did you find it?",
+    "Can you describe the item's condition?",
+    "Can you share a safe public meeting point?",
+    "Are you ready to initiate the verification challenge?",
+]
+
+PRE_VERIFICATION_ANSWERS_LOSTER = [
+    "I lost it on campus earlier today.",
+    "I lost it near the library / canteen area.",
+    "It has my personal marks and contents inside.",
+    "I can verify the secret challenge questions.",
+    "Yes, I am available to meet and verify.",
+]
+
+PRE_VERIFICATION_QUESTIONS_FINDER = [
+    "Can you describe key details or unique marks on the item?",
+    "When and where approximately did you lose it?",
+    "What brand, color, or model is the item?",
+    "Are you ready to answer the verification challenge?",
+    "Can you share a safe public meeting point?",
+]
+
+PRE_VERIFICATION_ANSWERS_FINDER = [
+    "I found it near the campus grounds / academic block.",
+    "I found it earlier today and kept it safe.",
+    "The item is in good condition and kept securely.",
+    "Let's coordinate at a campus security desk or public spot.",
+    "Please answer the verification challenge so we can proceed.",
+]
+
 PRE_VERIFICATION_MESSAGES = frozenset(
-    {
-        "Where exactly did you find it?",
-        "Can you describe the item?",
-        "What time did you find it?",
-        "Can you share a safe public meeting point?",
-    }
+    PRE_VERIFICATION_QUESTIONS_LOSTER
+    + PRE_VERIFICATION_ANSWERS_LOSTER
+    + PRE_VERIFICATION_QUESTIONS_FINDER
+    + PRE_VERIFICATION_ANSWERS_FINDER
+    # Backwards compatibility with previous initial templates
+    + ["Can you describe the item?"]
 )
 
 
@@ -103,12 +167,23 @@ async def get_or_create_thread(payload: ChatThreadRequest):
 
     claimant_email = complaint["reporterEmail"]
     founder_email = found["reporterEmail"]
+    claimant_name = complaint.get("reporterName") or complaint.get("reportedBy") or "Item Owner"
+    founder_name = found.get("reporterName") or found.get("reportedBy") or "Item Finder"
     if payload.requesterEmail not in (claimant_email, founder_email):
         raise HTTPException(status_code=403, detail="You are not associated with either report.")
 
     thread_id = _thread_id(payload.complaintId, payload.foundItemId)
     existing = await chat_threads_collection().find_one({"_id": thread_id})
     if existing:
+        updates = {}
+        if not existing.get("claimantName"):
+            updates["claimantName"] = claimant_name
+            existing["claimantName"] = claimant_name
+        if not existing.get("founderName"):
+            updates["founderName"] = founder_name
+            existing["founderName"] = founder_name
+        if updates:
+            await chat_threads_collection().update_one({"_id": thread_id}, {"$set": updates})
         return ChatThreadOut(threadId=thread_id, **{k: v for k, v in existing.items() if k != "_id"})
 
     lost_vecs = {
@@ -139,6 +214,8 @@ async def get_or_create_thread(payload: ChatThreadRequest):
         "foundItemId": payload.foundItemId,
         "claimantEmail": claimant_email,
         "founderEmail": founder_email,
+        "claimantName": claimant_name,
+        "founderName": founder_name,
         "confidence": confidence,
         "status": "chat",
         "createdAt": now,
@@ -247,7 +324,7 @@ async def chat_ws(websocket: WebSocket, thread_id: str, email: str = Query(...))
         await websocket.close(code=4403)
         return
 
-    await manager.connect(thread_id, websocket)
+    await manager.connect(thread_id, websocket, email)
     try:
         while True:
             data = await websocket.receive_json()
@@ -276,7 +353,7 @@ async def chat_ws(websocket: WebSocket, thread_id: str, email: str = Query(...))
                 await websocket.send_json(
                     {
                         "type": "error",
-                        "message": "Before verification, choose one of the allowed question messages.",
+                        "message": "Before verification, choose one of the allowed template questions or answers.",
                         "allowedMessages": sorted(PRE_VERIFICATION_MESSAGES),
                     }
                 )
@@ -356,4 +433,11 @@ async def chat_ws(websocket: WebSocket, thread_id: str, email: str = Query(...))
                     {"type": "moderation_notice", "tier": "nudge", "message": TIER_RESPONSES["nudge"]}
                 )
     except WebSocketDisconnect:
-        manager.disconnect(thread_id, websocket)
+        disconnected_email = manager.disconnect(thread_id, websocket)
+        if disconnected_email:
+            await manager.broadcast(thread_id, {
+                "type": "presence",
+                "onlineEmails": manager.get_online_emails(thread_id),
+                "userEmail": disconnected_email,
+                "status": "offline",
+            })
