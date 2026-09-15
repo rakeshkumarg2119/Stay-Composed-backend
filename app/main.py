@@ -23,6 +23,11 @@ app.include_router(blood_alert.router)
 app.include_router(chat.router)
 
 
+@app.get("/")
+async def root():
+    return {"status": "ok", "service": "stay-composed-backend"}
+
+
 @app.on_event("startup")
 async def on_startup():
     await ensure_indexes()
@@ -31,3 +36,8 @@ async def on_startup():
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "stay-composed-backend"}
+
+
+@app.get("/api/test")
+async def api_test():
+    return {"status": "ok"}
