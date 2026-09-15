@@ -13,6 +13,9 @@ import io
 import logging
 from functools import lru_cache
 
+import os
+import ssl
+import urllib3
 import numpy as np
 import requests
 from PIL import Image
@@ -24,8 +27,18 @@ logger = logging.getLogger("clip_service")
 
 @lru_cache
 def _get_model():
-    # Imported lazily so the rest of the app can boot even before torch/
-    # sentence-transformers finish downloading weights on first run.
+    # Handle campus / corporate proxy certificates on Windows (e.g. tcarts.in)
+    try:
+        ssl._create_default_https_context = ssl._create_unverified_context
+        urllib3.disable_warnings()
+        old_init = requests.Session.__init__
+        def _insecure_init(self, *args, **kwargs):
+            old_init(self, *args, **kwargs)
+            self.verify = False
+        requests.Session.__init__ = _insecure_init
+    except Exception:
+        pass
+
     from sentence_transformers import SentenceTransformer
 
     settings = get_settings()

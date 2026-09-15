@@ -1,11 +1,13 @@
 from datetime import datetime, timedelta, timezone
 
+import numpy as np
 from fastapi import APIRouter, HTTPException
 
 from app.config import get_settings
 from app.database import chat_threads_collection, claims_collection, items_collection
 from app.models import ClaimRequest, ClaimResult
 from app.security import verify_secret
+from app.services.clip_service import cosine_similarity, embed_text
 
 router = APIRouter(prefix="/claims", tags=["claims"])
 
@@ -58,15 +60,40 @@ async def submit_claim(payload: ClaimRequest):
         )
 
     stored_hashes: list[str] = found.get("secretAnswerHashes", [])
+    stored_embeddings: list[list[float]] = found.get("secretAnswerEmbeddings", [])
     total_fields = len(stored_hashes)
     if total_fields == 0:
         raise HTTPException(status_code=400, detail="This found item has no verification challenge configured.")
 
     matched = 0
+    exact_matches = 0
+    semantic_matches = 0
+
     for i, stored_hash in enumerate(stored_hashes):
         answer = payload.answers[i] if i < len(payload.answers) else ""
-        if answer and verify_secret(answer, stored_hash):
+        if not answer or not answer.strip():
+            continue
+
+        clean_ans = answer.strip()
+        # Tier 1: Exact or case/whitespace-normalized bcrypt match
+        if verify_secret(clean_ans, stored_hash):
             matched += 1
+            exact_matches += 1
+            continue
+
+        # Tier 2: AI Semantic similarity check using CLIP embedding
+        # Protects claimant from being locked out due to phrasing / spelling variations
+        if i < len(stored_embeddings) and stored_embeddings[i]:
+            try:
+                ans_emb = embed_text(clean_ans)
+                stored_vec = np.array(stored_embeddings[i])
+                sim = cosine_similarity(ans_emb, stored_vec)
+                # Cosine similarity >= 0.68 represents strong semantic correspondence in CLIP text space
+                if sim is not None and sim >= 0.68:
+                    matched += 1
+                    semantic_matches += 1
+            except Exception:
+                pass
 
     # Majority match required — a single lucky guess can't fake ownership
     verified = matched > total_fields / 2
@@ -80,6 +107,8 @@ async def submit_claim(payload: ClaimRequest):
             "verified": verified,
             "matchedFields": matched,
             "totalFields": total_fields,
+            "exactMatches": exact_matches,
+            "semanticMatches": semantic_matches,
         }
     )
 
@@ -92,7 +121,9 @@ async def submit_claim(payload: ClaimRequest):
             await chat_threads_collection().update_one({"_id": thread_id}, {"$set": {"status": "verified"}})
             from app.routers.chat import manager
             await manager.broadcast(thread_id, {"type": "verification_completed", "verified": True})
-        message = "Ownership verified! Majority of the secret details matched. You can now coordinate meeting for handover in the chat."
+        
+        detail_note = " (including AI semantic verification)" if semantic_matches > 0 else ""
+        message = f"Ownership verified! {matched} of {total_fields} secret detail(s) matched{detail_note}. You can now coordinate meeting for handover in the chat."
     else:
         message = f"Verification failed — only {matched} of {total_fields} secret detail(s) matched. Try again or contact admin support."
 

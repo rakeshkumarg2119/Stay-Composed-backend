@@ -1,0 +1,119 @@
+Backend true-owner and chat behavior
+
+Implemented server-side changes
+
+- Pre-verification WebSocket messages are restricted to a fixed whitelist.
+- Messages are blocked while the thread status is `verifying`.
+- Free-text messages are allowed again only when the thread status is `verified`, which is set after `POST /claims` returns `verified: true`.
+- `GET /items/mine` now includes the top-level `chatConfidenceThreshold` field.
+- Phase changes are pushed over the WebSocket using `event: "phase_changed"`.
+
+Pre-verification whitelist
+
+The exact allowed message text is:
+
+- `Where exactly did you find it?`
+- `Can you describe the item?`
+- `What time did you find it?`
+- `Can you share a safe public meeting point?`
+
+If a different message is sent while the thread is in `chat`, the server responds with an error and an `allowedMessages` array containing the same four messages in sorted order.
+
+Phase events
+
+When `POST /chat/{thread_id}/start-verification` succeeds:
+
+```json
+{
+  "event": "phase_changed",
+  "status": "verification_pending"
+}
+```
+
+The stored/API thread status for this phase remains `verifying`.
+
+When `POST /claims` succeeds with `verified: true`:
+
+```json
+{
+  "event": "phase_changed",
+  "status": "verified"
+}
+```
+
+When `POST /chat/{thread_id}/complete-handover` succeeds:
+
+```json
+{
+  "event": "phase_changed",
+  "status": "handed_over"
+}
+```
+
+The backend also continues sending its existing `verification_started`, `verification_completed`, and `handover_completed` events.
+
+GET /items/mine
+
+The response now contains this top-level field:
+
+```json
+{
+  "chatConfidenceThreshold": 50
+}
+```
+
+Exact field name: `chatConfidenceThreshold`.
+
+Its value is the configured `CHAT_MIN_CONFIDENCE` value. The default is `50`.
+
+POST /chat/thread confidence rejection
+
+Yes. The route calculates match confidence and rejects a request below `chatConfidenceThreshold` (`CHAT_MIN_CONFIDENCE`, default `50`). FastAPI returns HTTP `403` with this JSON shape:
+
+```json
+{
+  "detail": "AI match confidence (42) hasn't reached the chat threshold (50) yet."
+}
+```
+
+The actual confidence number is inserted into the message.
+
+Claim answer matching
+
+`POST /claims` matches `answers[i]` by position against the found item's stored verification answer hash at index `i`. It does not match by question text, question ID, or reordered questions.
+
+The backend first tries the exact/case-normalized hash check. If that fails and a stored embedding exists at the same index, it tries semantic similarity for that same index.
+
+Null challenge questions
+
+There is no fallback to the lost item's `secretFeatures` list. Found-item verification uses the found item's `secretAnswerHashes` and `secretAnswerEmbeddings`.
+
+The current `POST /items` validation rejects a found item when `challengeQuestions` or `secretAnswers` is missing/empty, so a normally-created found item cannot have `challengeQuestions: null`. For a legacy database record with no stored answer hashes, `POST /claims` returns HTTP `400`:
+
+```json
+{
+  "detail": "This found item has no verification challenge configured."
+}
+```
+
+Chat transport
+
+WebSocket:
+
+`/chat/ws/{thread_id}?email=owner@example.com`
+
+Flutter dependency:
+
+`web_socket_channel`
+
+Claim verification flow
+
+- The true owner creates a lost report with `POST /items` and `type: "lost"`.
+- The owner reads matches and `chatConfidenceThreshold` from `GET /items/mine?email=...`.
+- A thread can be opened with `POST /chat/thread` only when confidence meets the threshold.
+- Before verification, only the four canned messages are accepted.
+- The finder starts verification with `POST /chat/{thread_id}/start-verification`.
+- Messages are blocked while the status is `verifying`.
+- The owner submits indexed answers through `POST /claims`.
+- A successful claim changes the thread to `verified`; free-text chat is then accepted.
+- Either participant completes handover with `POST /chat/{thread_id}/complete-handover?email=...`.

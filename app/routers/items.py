@@ -91,6 +91,7 @@ async def create_item(payload: ItemCreate):
         clean_answers = [a.strip() for a in (payload.secretAnswers or []) if a.strip()]
         doc["challengeQuestions"] = clean_questions
         doc["secretAnswerHashes"] = [hash_secret(a) for a in clean_answers]
+        doc["secretAnswerEmbeddings"] = [_safe_list(embed_text(a)) for a in clean_answers]
 
     await items_collection().insert_one(doc)
     return _to_out(doc, include_secrets=True)

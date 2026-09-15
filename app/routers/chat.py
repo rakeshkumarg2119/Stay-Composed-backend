@@ -200,11 +200,11 @@ async def complete_handover(thread_id: str, email: str = Query(...)):
     )
     await items_collection().update_one(
         {"_id": thread["foundItemId"]},
-        {"$set": {"status": "handed_over", "handedOverAt": now}},
+        {"$set": {"status": "resolved", "handedOverAt": now}},
     )
     await items_collection().update_one(
         {"_id": thread["complaintId"]},
-        {"$set": {"status": "handed_over", "handedOverAt": now}},
+        {"$set": {"status": "resolved", "handedOverAt": now}},
     )
     await manager.broadcast(thread_id, {
         "type": "handover_completed",
@@ -233,7 +233,7 @@ async def chat_ws(websocket: WebSocket, thread_id: str, email: str = Query(...))
                 continue
 
             current = await chat_threads_collection().find_one({"_id": thread_id})
-            if not current or current["status"] in ("handed_over", "closed"):
+            if not current or current["status"] in ("handed_over", "closed", "resolved"):
                 await websocket.send_json({"type": "error", "message": "This chat is closed — item handover has been completed."})
                 continue
 
