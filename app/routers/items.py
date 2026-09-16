@@ -249,16 +249,20 @@ async def my_items(email: str = Query(...)):
     )
 
 
+DEFAULT_DEMO_EMAILS = "24suca17@tcarts.in,24suca11@tcarts.in,24suca111@tcarts.in"
+
+
 @router.delete("/demo-reset")
-async def demo_reset(emails: str = Query("24suca17@tcarts.in,24suca111@tcarts.in")):
+async def demo_reset(emails: str = Query(DEFAULT_DEMO_EMAILS)):
     """
     Cleans up all demo items and their associated chat threads / messages
     for the hackathon presentation test accounts so the database is
     clean and ready for another presentation run.
     """
-    from app.database import chat_messages_collection, chat_threads_collection
+    from app.database import chat_messages_collection, chat_threads_collection, claims_collection
 
-    email_list = [e.strip().lower() for e in emails.split(",") if e.strip()]
+    raw_emails = emails if isinstance(emails, str) else DEFAULT_DEMO_EMAILS
+    email_list = [e.strip().lower() for e in raw_emails.split(",") if e.strip()]
     if not email_list:
         return {"status": "ok", "deletedItems": 0, "deletedThreads": 0}
 
@@ -281,6 +285,15 @@ async def demo_reset(emails: str = Query("24suca17@tcarts.in,24suca111@tcarts.in
     thread_res = await chat_threads_collection().delete_many({"_id": {"$in": thread_ids}})
     if thread_ids:
         await chat_messages_collection().delete_many({"threadId": {"$in": thread_ids}})
+
+    # 4. Clean up claim attempts for these items and accounts
+    await claims_collection().delete_many({
+        "$or": [
+            {"claimantEmail": {"$in": email_list}},
+            {"foundItemId": {"$in": item_ids}},
+            {"complaintId": {"$in": item_ids}},
+        ]
+    })
 
     return {
         "status": "ok",

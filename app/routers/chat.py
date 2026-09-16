@@ -9,6 +9,7 @@ from app.config import get_settings
 from app.database import chat_messages_collection, chat_threads_collection, items_collection
 from app.models import ChatMessageOut, ChatThreadOut, ChatThreadRequest
 from app.security import sanitize_chat_text
+from app.services.email_service import send_match_found_email
 from app.services.matching import score_pair
 from app.services.moderation import TIER_RESPONSES, classify_message
 from app.services.push_service import send_push_to_email
@@ -75,11 +76,32 @@ class ConnectionManager:
         return email in self.get_online_emails(thread_id)
 
     async def broadcast(self, thread_id: str, payload: dict) -> None:
+        dead: list[WebSocket] = []
         for ws, _ in list(self._threads.get(thread_id, [])):
             try:
                 await ws.send_json(payload)
             except Exception:
-                self.disconnect(thread_id, ws)
+                dead.append(ws)
+
+        # A send failure means that socket is actually gone (client dropped
+        # without a clean WebSocketDisconnect, e.g. app backgrounded / network
+        # loss). Previously we just removed it from the registry here without
+        # telling the other participant, so their screen kept showing
+        # "online" indefinitely — the socket was gone but presence never
+        # updated. Now we clean up AND broadcast the resulting offline status.
+        for ws in dead:
+            disconnected_email = self.disconnect(thread_id, ws)
+            if disconnected_email:
+                for peer_ws, _ in list(self._threads.get(thread_id, [])):
+                    try:
+                        await peer_ws.send_json({
+                            "type": "presence",
+                            "onlineEmails": self.get_online_emails(thread_id),
+                            "userEmail": disconnected_email,
+                            "status": "offline",
+                        })
+                    except Exception:
+                        pass
 
 
 manager = ConnectionManager()
@@ -127,6 +149,20 @@ PRE_VERIFICATION_MESSAGES = frozenset(
     # Backwards compatibility with previous initial templates
     + ["Can you describe the item?"]
 )
+
+
+@router.get("/templates")
+async def get_templates(role: str = Query(..., pattern="^(loster|finder)$")):
+    """
+    Serves the full pre-verification suggestion list for a role so the
+    frontend can render every question/answer (as a scrollable list of
+    quick-reply chips) instead of hardcoding a short, truncated subset.
+    These are suggestions only — see the note on PRE_VERIFICATION_MESSAGES
+    below, free text is allowed too.
+    """
+    if role == "loster":
+        return {"questions": PRE_VERIFICATION_QUESTIONS_LOSTER, "answers": PRE_VERIFICATION_ANSWERS_LOSTER}
+    return {"questions": PRE_VERIFICATION_QUESTIONS_FINDER, "answers": PRE_VERIFICATION_ANSWERS_FINDER}
 
 
 def _thread_id(complaint_id: str, found_item_id: str) -> str:
@@ -230,6 +266,36 @@ async def get_or_create_thread(payload: ChatThreadRequest):
         "heldMessageCount": 0,
     }
     await chat_threads_collection().insert_one(doc)
+
+    # ------------------------------------------------------------------
+    # Notify whichever party did NOT trigger this thread. Previously a
+    # thread being created here (as opposed to the automatic match-scan in
+    # items.py `_notify_new_matches`, which only fires at item-creation
+    # time) sent no email and no push at all — the other party had no way
+    # to find out short of polling GET /chat/my-threads themselves.
+    # ------------------------------------------------------------------
+    other_email = founder_email if payload.requesterEmail == claimant_email else claimant_email
+    other_is_lost_reporter = other_email == claimant_email
+    try:
+        await send_match_found_email(
+            other_email,
+            is_lost_reporter=other_is_lost_reporter,
+            other_item_title=found["title"] if other_is_lost_reporter else complaint["title"],
+            confidence=confidence,
+        )
+    except Exception:
+        logger.exception("Failed sending chat-started email for thread %s", thread_id)
+
+    try:
+        await send_push_to_email(
+            other_email,
+            title="Match found — chat started",
+            body=f"A chat has started for your {'lost' if other_is_lost_reporter else 'found'} report.",
+            data={"type": "chat_started", "relatedId": thread_id},
+        )
+    except Exception:
+        logger.exception("Failed sending chat-started push for thread %s", thread_id)
+
     return ChatThreadOut(threadId=thread_id, **{k: v for k, v in doc.items() if k != "_id"})
 
 
@@ -356,15 +422,12 @@ async def chat_ws(websocket: WebSocket, thread_id: str, email: str = Query(...))
                 )
                 continue
 
-            if current["status"] == "chat" and text not in PRE_VERIFICATION_MESSAGES:
-                await websocket.send_json(
-                    {
-                        "type": "error",
-                        "message": "Before verification, choose one of the allowed template questions or answers.",
-                        "allowedMessages": sorted(PRE_VERIFICATION_MESSAGES),
-                    }
-                )
-                continue
+            # NOTE: pre-verification used to hard-require picking one of the
+            # PRE_VERIFICATION_MESSAGES templates (fishing-for-secrets
+            # mitigation). Per updated decision, the templates stay as
+            # suggested quick-replies (served via GET /chat/templates) but
+            # free text is now allowed too — moderation + rate limiting
+            # below still apply to every message either way.
 
             if current["status"] not in ("chat", "verified"):
                 await websocket.send_json(
@@ -457,6 +520,16 @@ async def chat_ws(websocket: WebSocket, thread_id: str, email: str = Query(...))
                     {"type": "moderation_notice", "tier": "nudge", "message": TIER_RESPONSES["nudge"]}
                 )
     except WebSocketDisconnect:
+        pass
+    except Exception:
+        # A dropped connection can surface as something other than a clean
+        # WebSocketDisconnect (network loss, app backgrounded/killed, proxy
+        # timeout). Previously only WebSocketDisconnect triggered cleanup,
+        # so those cases left a stale entry in the registry and the other
+        # participant kept seeing "online" forever. Catch broadly here and
+        # always clean up in `finally` below instead.
+        logger.exception("Unexpected error in chat websocket for thread %s", thread_id)
+    finally:
         disconnected_email = manager.disconnect(thread_id, websocket)
         if disconnected_email:
             await manager.broadcast(thread_id, {
