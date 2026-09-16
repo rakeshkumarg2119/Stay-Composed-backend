@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
 from app.database import ensure_indexes
-from app.routers import blood_alert, chat, claims, items
+from app.routers import blood_alert, chat, claims, devices, items
 
 settings = get_settings()
 
@@ -21,6 +21,7 @@ app.include_router(items.router)
 app.include_router(claims.router)
 app.include_router(blood_alert.router)
 app.include_router(chat.router)
+app.include_router(devices.router)
 
 
 @app.get("/")

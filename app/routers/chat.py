@@ -1,3 +1,4 @@
+import logging
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -10,8 +11,11 @@ from app.models import ChatMessageOut, ChatThreadOut, ChatThreadRequest
 from app.security import sanitize_chat_text
 from app.services.matching import score_pair
 from app.services.moderation import TIER_RESPONSES, classify_message
+from app.services.push_service import send_push_to_email
 
 router = APIRouter(prefix="/chat", tags=["chat"])
+
+logger = logging.getLogger("chat")
 
 # Consecutive "held" messages from the same sender before the whole
 # conversation gets auto-frozen and routed to admin review.
@@ -66,6 +70,9 @@ class ConnectionManager:
 
     def get_online_emails(self, thread_id: str) -> list[str]:
         return list({email for _, email in self._threads.get(thread_id, [])})
+
+    def is_online(self, thread_id: str, email: str) -> bool:
+        return email in self.get_online_emails(thread_id)
 
     async def broadcast(self, thread_id: str, payload: dict) -> None:
         for ws, _ in list(self._threads.get(thread_id, [])):
@@ -427,6 +434,23 @@ async def chat_ws(websocket: WebSocket, thread_id: str, email: str = Query(...))
             }
             await chat_messages_collection().insert_one(msg_doc)
             await manager.broadcast(thread_id, {"type": "message", **{k: v for k, v in msg_doc.items() if k != "_id"}, "id": msg_doc["_id"], "sentAt": msg_doc["sentAt"].isoformat()})
+
+            # Push only to the *other* participant, and only if they aren't
+            # currently connected to this thread's socket — otherwise
+            # they'd see the message live AND get a redundant push for the
+            # same thing.
+            recipient = current["founderEmail"] if email == current["claimantEmail"] else current["claimantEmail"]
+            if not manager.is_online(thread_id, recipient):
+                try:
+                    sender_name = current.get("claimantName") if email == current["claimantEmail"] else current.get("founderName")
+                    await send_push_to_email(
+                        recipient,
+                        title=sender_name or email,
+                        body=text[:120],
+                        data={"type": "chat_message", "relatedId": thread_id},
+                    )
+                except Exception:
+                    logger.exception("Failed sending chat push for thread %s", thread_id)
 
             if tier == "nudge":
                 await websocket.send_json(

@@ -33,6 +33,12 @@ class Settings(BaseSettings):
     chat_max_messages_per_minute: int = 20
     chat_message_max_length: int = 1000
 
+    # Push notifications (FCM) — path to the service-account private-key
+    # JSON from Firebase Console > Project Settings > Service Accounts.
+    # NOT the Flutter app's google-services.json (that one's client-only).
+    # Empty string = push is a no-op everywhere (see push_service.py).
+    firebase_credentials_path: str = ""
+
     @property
     def allowed_origins_list(self) -> list[str]:
         return [o.strip() for o in self.allowed_origins.split(",") if o.strip()]

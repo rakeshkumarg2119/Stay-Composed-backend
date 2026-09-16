@@ -50,3 +50,41 @@ async def send_blood_alert(recipients: list[str], student_name: str, blood_type:
             except Exception:
                 logger.exception("Failed to send blood alert to %s", addr)
     return sent
+
+
+async def send_match_found_email(
+    to_addr: str,
+    *,
+    is_lost_reporter: bool,
+    other_item_title: str,
+    confidence: int,
+) -> bool:
+    """
+    Fired once per new match crossing chat_min_confidence — see
+    app/routers/items.py `create_item`. One email per matched party per
+    match, not a digest; dedup/rate-limiting is the caller's job if this
+    turns out to be too noisy in practice.
+    """
+    settings = get_settings()
+    role = "lost item" if is_lost_reporter else "found item"
+    subject = f"🔎 Possible match found for your {role} — Stay Composed"
+    body = (
+        f"A possible match was found for your report.\n\n"
+        f"Matched against: {other_item_title}\n"
+        f"Match confidence: {confidence}%\n\n"
+        f"Open the app to view details and start a chat with the other party "
+        f"to coordinate verification.\n"
+    )
+
+    if not settings.smtp_user or not settings.smtp_password:
+        logger.warning("SMTP credentials not configured — skipping match email (dry run) to %s", to_addr)
+        return False
+
+    try:
+        async with aiosmtplib.SMTP(hostname=settings.smtp_host, port=settings.smtp_port, start_tls=True) as smtp:
+            await smtp.login(settings.smtp_user, settings.smtp_password)
+            await smtp.send_message(_build_message(to_addr, subject, body))
+        return True
+    except Exception:
+        logger.exception("Failed to send match-found email to %s", to_addr)
+        return False

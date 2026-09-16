@@ -1,3 +1,4 @@
+import logging
 import uuid
 from datetime import datetime, timezone
 
@@ -8,8 +9,12 @@ from app.database import items_collection
 from app.models import CandidateMatch, ItemCreate, ItemOut, MineResponse
 from app.security import hash_secret, mask_display_name
 from app.services.clip_service import embed_image_url, embed_text
+from app.services.email_service import send_match_found_email
 from app.services.matching import score_pair
+from app.services.push_service import send_push_to_email
 from app.utils.locations import format_location, validate_location
+
+logger = logging.getLogger("items")
 
 router = APIRouter(prefix="/items", tags=["items"])
 
@@ -94,11 +99,109 @@ async def create_item(payload: ItemCreate):
         doc["secretAnswerEmbeddings"] = [_safe_list(embed_text(a)) for a in clean_answers]
 
     await items_collection().insert_one(doc)
+    await _notify_new_matches(doc)
     return _to_out(doc, include_secrets=True)
 
 
 def _safe_list(vec):
     return vec.tolist() if vec is not None else None
+
+
+def _scored(doc: dict) -> dict:
+    import numpy as np
+
+    return {
+        "category": doc.get("category"),
+        "location": doc.get("location"),
+        "_textEmbedding": np.array(doc["textEmbedding"]) if doc.get("textEmbedding") else None,
+        "_imageEmbedding": np.array(doc["imageEmbedding"]) if doc.get("imageEmbedding") else None,
+    }
+
+
+async def _notify_new_matches(new_doc: dict) -> None:
+    """
+    Runs once, right after a new item is inserted — scores it against every
+    open item of the opposite type and emails both parties on any pair
+    crossing chat_min_confidence (same threshold that unlocks chat).
+
+    Deliberately email-only for now: there's no FCM push infra in this
+    backend yet (no device-token storage, no firebase-admin dependency
+    confirmed, no registration endpoint) — that's a separate build, not a
+    one-line hook like this one.
+
+    Failures here are logged, never raised — a broken notification must
+    never fail the actual item report.
+    """
+    settings = get_settings()
+    opposite_type = "lost" if new_doc["type"] == "found" else "found"
+
+    try:
+        candidates = [d async for d in items_collection().find({"type": opposite_type, "status": "open"})]
+    except Exception:
+        logger.exception("Could not load candidates for match notification on %s", new_doc["_id"])
+        return
+
+    new_scored = _scored(new_doc)
+    for other in candidates:
+        if other.get("status") in ("handed_over", "resolved"):
+            continue
+        try:
+            confidence = score_pair(
+                new_scored if new_doc["type"] == "lost" else _scored(other),
+                _scored(other) if new_doc["type"] == "lost" else new_scored,
+            )
+        except Exception:
+            logger.exception("Scoring failed for %s vs %s", new_doc["_id"], other["_id"])
+            continue
+
+        if confidence < settings.chat_min_confidence:
+            continue
+
+        lost_doc, found_doc = (new_doc, other) if new_doc["type"] == "lost" else (other, new_doc)
+
+        try:
+            await send_match_found_email(
+                lost_doc["reporterEmail"],
+                is_lost_reporter=True,
+                other_item_title=found_doc["title"],
+                confidence=confidence,
+            )
+            await send_match_found_email(
+                found_doc["reporterEmail"],
+                is_lost_reporter=False,
+                other_item_title=lost_doc["title"],
+                confidence=confidence,
+            )
+        except Exception:
+            logger.exception("Failed sending match-found emails for %s <-> %s", lost_doc["_id"], found_doc["_id"])
+
+        try:
+            await send_push_to_email(
+                lost_doc["reporterEmail"],
+                title="Possible match found",
+                body=f"A found item may match your lost report: {found_doc['title']}",
+                data={
+                    "type": "match_found",
+                    "relatedId": lost_doc["_id"],
+                    "complaintId": lost_doc["_id"],
+                    "foundItemId": found_doc["_id"],
+                    "confidence": str(confidence),
+                },
+            )
+            await send_push_to_email(
+                found_doc["reporterEmail"],
+                title="Possible match found",
+                body=f"Your found item may match a lost report: {lost_doc['title']}",
+                data={
+                    "type": "match_found",
+                    "relatedId": found_doc["_id"],
+                    "complaintId": lost_doc["_id"],
+                    "foundItemId": found_doc["_id"],
+                    "confidence": str(confidence),
+                },
+            )
+        except Exception:
+            logger.exception("Failed sending match-found push for %s <-> %s", lost_doc["_id"], found_doc["_id"])
 
 
 @router.get("/mine", response_model=MineResponse)
@@ -144,3 +247,43 @@ async def my_items(email: str = Query(...)):
         candidateMatches=candidate_matches,
         chatConfidenceThreshold=settings.chat_min_confidence,
     )
+
+
+@router.delete("/demo-reset")
+async def demo_reset(emails: str = Query("24suca17@tcarts.in,24suca111@tcarts.in")):
+    """
+    Cleans up all demo items and their associated chat threads / messages
+    for the hackathon presentation test accounts so the database is
+    clean and ready for another presentation run.
+    """
+    from app.database import chat_messages_collection, chat_threads_collection
+
+    email_list = [e.strip().lower() for e in emails.split(",") if e.strip()]
+    if not email_list:
+        return {"status": "ok", "deletedItems": 0, "deletedThreads": 0}
+
+    # 1. Collect all matching item IDs to also clean up any cross-referenced threads
+    item_docs = [d async for d in items_collection().find({"reporterEmail": {"$in": email_list}}, {"_id": 1})]
+    item_ids = [d["_id"] for d in item_docs]
+
+    # 2. Delete the items
+    item_res = await items_collection().delete_many({"reporterEmail": {"$in": email_list}})
+
+    # 3. Delete threads and their messages
+    thread_docs = [
+        d async for d in chat_threads_collection().find(
+            {"$or": [{"claimantEmail": {"$in": email_list}}, {"founderEmail": {"$in": email_list}}, {"foundItemId": {"$in": item_ids}}, {"complaintId": {"$in": item_ids}}]},
+            {"_id": 1}
+        )
+    ]
+    thread_ids = [d["_id"] for d in thread_docs]
+
+    thread_res = await chat_threads_collection().delete_many({"_id": {"$in": thread_ids}})
+    if thread_ids:
+        await chat_messages_collection().delete_many({"threadId": {"$in": thread_ids}})
+
+    return {
+        "status": "ok",
+        "deletedItems": item_res.deleted_count,
+        "deletedThreads": thread_res.deleted_count,
+    }

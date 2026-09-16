@@ -133,3 +133,13 @@ class ChatMessageOut(BaseModel):
     senderEmail: EmailStr
     text: str
     sentAt: datetime
+
+
+# ---------------------------------------------------------------------------
+# Push notification device tokens
+# ---------------------------------------------------------------------------
+
+class DeviceTokenRegister(BaseModel):
+    email: EmailStr
+    token: str = Field(min_length=10)
+    platform: Literal["android", "ios"] = "android"

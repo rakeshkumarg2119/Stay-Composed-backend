@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query
 
 from app.database import blood_alerts_collection, staff_collection
 from app.models import BloodAlertRequest, BloodAlertResult
@@ -59,3 +59,36 @@ async def create_blood_alert(payload: BloodAlertRequest):
         recipientsNotified=sent_count,
         message=f"Broadcast sent campus-wide to {sent_count} staff member(s) across all departments.",
     )
+
+
+@router.get("/staff")
+async def list_staff_recipients():
+    staff_docs = [
+        {"email": d["email"], "department": d.get("department", "Staff / Faculty")}
+        async for d in staff_collection().find({}, {"email": 1, "department": 1})
+        if d.get("email")
+    ]
+    email_list = [d["email"] for d in staff_docs]
+    return {"staff": email_list, "details": staff_docs}
+
+
+@router.post("/staff")
+async def add_staff_recipient(payload: dict):
+    email = payload.get("email", "").strip().lower()
+    department = payload.get("department", "Judge / Guest Faculty").strip()
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="Valid email address is required.")
+
+    await staff_collection().update_one(
+        {"email": email},
+        {"$set": {"email": email, "department": department, "addedAt": datetime.now(timezone.utc)}},
+        upsert=True,
+    )
+    return {"status": "ok", "email": email}
+
+
+@router.delete("/staff/{email}")
+async def remove_staff_recipient(email: str):
+    clean_email = email.strip().lower()
+    result = await staff_collection().delete_one({"email": clean_email})
+    return {"status": "ok", "deletedCount": result.deleted_count}
