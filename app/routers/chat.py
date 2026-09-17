@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -7,9 +8,8 @@ from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketDisconn
 
 from app.config import get_settings
 from app.database import chat_messages_collection, chat_threads_collection, items_collection
-from app.models import ChatMessageOut, ChatThreadOut, ChatThreadRequest
+from app.models import ChatMessageOut, ChatTemplatesOut, ChatThreadOut, ChatThreadRequest
 from app.security import sanitize_chat_text
-from app.services.email_service import send_match_found_email
 from app.services.matching import score_pair
 from app.services.moderation import TIER_RESPONSES, classify_message
 from app.services.push_service import send_push_to_email
@@ -22,6 +22,17 @@ logger = logging.getLogger("chat")
 # conversation gets auto-frozen and routed to admin review.
 HELD_ESCALATION_THRESHOLD = 3
 
+# Presence heartbeat. WebSocketDisconnect only fires on a *clean* close.
+# A backgrounded phone, a locked screen, a dropped mobile network, or a
+# proxy silently killing an idle socket never sends a close frame — so
+# without an active liveness check, a party who has actually gone offline
+# stays in the "online" registry forever (or until the OS eventually
+# times out the TCP connection, which can be many minutes). We instead
+# ping every connection on an interval and prune anything that fails to
+# respond within the timeout window.
+HEARTBEAT_INTERVAL_SECONDS = 20
+PRESENCE_TIMEOUT_SECONDS = 45
+
 
 # ---------------------------------------------------------------------------
 # In-memory WebSocket registry (per-process). Fine for a single backend
@@ -31,10 +42,14 @@ HELD_ESCALATION_THRESHOLD = 3
 class ConnectionManager:
     def __init__(self) -> None:
         self._threads: dict[str, list[tuple[WebSocket, str]]] = {}
+        self._last_seen: dict[WebSocket, datetime] = {}
+        self._heartbeat_task: asyncio.Task | None = None
 
     async def connect(self, thread_id: str, ws: WebSocket, email: str) -> None:
         await ws.accept()
         self._threads.setdefault(thread_id, []).append((ws, email))
+        self._last_seen[ws] = datetime.now(timezone.utc)
+        self.start_heartbeat()  # idempotent — guaranteed to run without depending on app-startup wiring
         online_emails = self.get_online_emails(thread_id)
         # Send initial presence frame to newly connected socket
         try:
@@ -67,6 +82,7 @@ class ConnectionManager:
             self._threads[thread_id] = remaining
         elif thread_id in self._threads:
             del self._threads[thread_id]
+        self._last_seen.pop(ws, None)
         return disconnected_email
 
     def get_online_emails(self, thread_id: str) -> list[str]:
@@ -76,32 +92,68 @@ class ConnectionManager:
         return email in self.get_online_emails(thread_id)
 
     async def broadcast(self, thread_id: str, payload: dict) -> None:
-        dead: list[WebSocket] = []
         for ws, _ in list(self._threads.get(thread_id, [])):
             try:
                 await ws.send_json(payload)
             except Exception:
-                dead.append(ws)
+                self.disconnect(thread_id, ws)
 
-        # A send failure means that socket is actually gone (client dropped
-        # without a clean WebSocketDisconnect, e.g. app backgrounded / network
-        # loss). Previously we just removed it from the registry here without
-        # telling the other participant, so their screen kept showing
-        # "online" indefinitely — the socket was gone but presence never
-        # updated. Now we clean up AND broadcast the resulting offline status.
-        for ws in dead:
-            disconnected_email = self.disconnect(thread_id, ws)
-            if disconnected_email:
-                for peer_ws, _ in list(self._threads.get(thread_id, [])):
+    def touch(self, ws: WebSocket) -> None:
+        """Call whenever anything is heard from this socket (a real message
+        or just a heartbeat pong) so it isn't reaped as stale."""
+        if ws in self._last_seen:
+            self._last_seen[ws] = datetime.now(timezone.utc)
+
+    async def _sweep_once(self) -> None:
+        now = datetime.now(timezone.utc)
+        for thread_id, conns in list(self._threads.items()):
+            for ws, email in list(conns):
+                last = self._last_seen.get(ws, now)
+                if (now - last).total_seconds() > PRESENCE_TIMEOUT_SECONDS:
+                    # No pong / activity within the timeout — treat as gone.
+                    disconnected_email = self.disconnect(thread_id, ws)
                     try:
-                        await peer_ws.send_json({
+                        await ws.close(code=4408)  # 4408 = timeout
+                    except Exception:
+                        pass
+                    if disconnected_email:
+                        await self.broadcast(thread_id, {
                             "type": "presence",
                             "onlineEmails": self.get_online_emails(thread_id),
                             "userEmail": disconnected_email,
                             "status": "offline",
                         })
-                    except Exception:
-                        pass
+                    continue
+                try:
+                    await ws.send_json({"type": "ping"})
+                except Exception:
+                    # The send itself failed — socket is dead right now,
+                    # don't wait for the timeout window.
+                    disconnected_email = self.disconnect(thread_id, ws)
+                    if disconnected_email:
+                        await self.broadcast(thread_id, {
+                            "type": "presence",
+                            "onlineEmails": self.get_online_emails(thread_id),
+                            "userEmail": disconnected_email,
+                            "status": "offline",
+                        })
+
+    async def _heartbeat_loop(self) -> None:
+        while True:
+            await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
+            try:
+                await self._sweep_once()
+            except Exception:
+                logger.exception("Presence heartbeat sweep failed")
+
+    def start_heartbeat(self) -> None:
+        if self._heartbeat_task is None:
+            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+
+    def stop_heartbeat(self) -> None:
+        if self._heartbeat_task is not None:
+            self._heartbeat_task.cancel()
+            self._heartbeat_task = None
 
 
 manager = ConnectionManager()
@@ -149,20 +201,6 @@ PRE_VERIFICATION_MESSAGES = frozenset(
     # Backwards compatibility with previous initial templates
     + ["Can you describe the item?"]
 )
-
-
-@router.get("/templates")
-async def get_templates(role: str = Query(..., pattern="^(loster|finder)$")):
-    """
-    Serves the full pre-verification suggestion list for a role so the
-    frontend can render every question/answer (as a scrollable list of
-    quick-reply chips) instead of hardcoding a short, truncated subset.
-    These are suggestions only — see the note on PRE_VERIFICATION_MESSAGES
-    below, free text is allowed too.
-    """
-    if role == "loster":
-        return {"questions": PRE_VERIFICATION_QUESTIONS_LOSTER, "answers": PRE_VERIFICATION_ANSWERS_LOSTER}
-    return {"questions": PRE_VERIFICATION_QUESTIONS_FINDER, "answers": PRE_VERIFICATION_ANSWERS_FINDER}
 
 
 def _thread_id(complaint_id: str, found_item_id: str) -> str:
@@ -267,36 +305,58 @@ async def get_or_create_thread(payload: ChatThreadRequest):
     }
     await chat_threads_collection().insert_one(doc)
 
-    # ------------------------------------------------------------------
-    # Notify whichever party did NOT trigger this thread. Previously a
-    # thread being created here (as opposed to the automatic match-scan in
-    # items.py `_notify_new_matches`, which only fires at item-creation
-    # time) sent no email and no push at all — the other party had no way
-    # to find out short of polling GET /chat/my-threads themselves.
-    # ------------------------------------------------------------------
-    other_email = founder_email if payload.requesterEmail == claimant_email else claimant_email
-    other_is_lost_reporter = other_email == claimant_email
-    try:
-        await send_match_found_email(
-            other_email,
-            is_lost_reporter=other_is_lost_reporter,
-            other_item_title=found["title"] if other_is_lost_reporter else complaint["title"],
-            confidence=confidence,
-        )
-    except Exception:
-        logger.exception("Failed sending chat-started email for thread %s", thread_id)
-
+    # NOTE: no email here on purpose. A thread only ever gets created once
+    # confidence >= chat_min_confidence — the exact same threshold
+    # app/routers/items.py::_notify_new_matches uses to decide whether to
+    # email both parties, and that function runs unconditionally the
+    # moment the later-created of these two items exists (scanning every
+    # already-open item of the opposite type). So by the time a thread can
+    # even be created here, the founder has already been emailed about
+    # this exact match once. Emailing them again here was a pure duplicate
+    # (this used to call send_match_found_email(founder_email, ...) — see
+    # git history if you need the previous version). The push below is
+    # kept because "someone opened a chat with you right now" is a
+    # genuinely distinct, timely signal that the match email doesn't
+    # carry — the match email could be from days ago.
     try:
         await send_push_to_email(
-            other_email,
-            title="Match found — chat started",
-            body=f"A chat has started for your {'lost' if other_is_lost_reporter else 'found'} report.",
-            data={"type": "chat_started", "relatedId": thread_id},
+            founder_email,
+            title="Someone wants to chat about your found item",
+            body=f"A claimant started a chat about: {found['title']}",
+            data={
+                "type": "chat_opened",
+                "relatedId": thread_id,
+                "complaintId": payload.complaintId,
+                "foundItemId": payload.foundItemId,
+            },
         )
     except Exception:
-        logger.exception("Failed sending chat-started push for thread %s", thread_id)
+        logger.exception("Failed sending founder chat-opened push for thread %s", thread_id)
 
     return ChatThreadOut(threadId=thread_id, **{k: v for k, v in doc.items() if k != "_id"})
+
+
+@router.get("/{thread_id}/templates", response_model=ChatTemplatesOut)
+async def get_templates(thread_id: str, email: str = Query(...)):
+    """
+    Full pre-verification template list for this participant's role.
+    Previously the frontend only ever learned about templates from the
+    'allowedMessages' field on a *rejected*-message error, which is why it
+    only ever had a partial/stale list to render (and nothing to render
+    before the user had already been rejected once). This endpoint lets
+    the client fetch the complete list up front, any time, so it can be
+    rendered as a proper scrollable picker. Free text is still allowed
+    alongside these — see the websocket handler.
+    """
+    thread = await _get_thread_or_404(thread_id)
+    _require_participant(thread, email)
+
+    if email == thread["claimantEmail"]:
+        role, questions, answers = "claimant", PRE_VERIFICATION_QUESTIONS_LOSTER, PRE_VERIFICATION_ANSWERS_LOSTER
+    else:
+        role, questions, answers = "founder", PRE_VERIFICATION_QUESTIONS_FINDER, PRE_VERIFICATION_ANSWERS_FINDER
+
+    return ChatTemplatesOut(role=role, questions=questions, answers=answers, freeTextAllowed=True)
 
 
 @router.get("/{thread_id}/messages", response_model=list[ChatMessageOut])
@@ -401,6 +461,7 @@ async def chat_ws(websocket: WebSocket, thread_id: str, email: str = Query(...))
     try:
         while True:
             data = await websocket.receive_json()
+            manager.touch(websocket)  # any frame (including a client pong) counts as "alive"
             text = sanitize_chat_text(str(data.get("text", "")), settings.chat_message_max_length)
             if not text:
                 continue
@@ -422,13 +483,10 @@ async def chat_ws(websocket: WebSocket, thread_id: str, email: str = Query(...))
                 )
                 continue
 
-            # NOTE: pre-verification used to hard-require picking one of the
-            # PRE_VERIFICATION_MESSAGES templates (fishing-for-secrets
-            # mitigation). Per updated decision, the templates stay as
-            # suggested quick-replies (served via GET /chat/templates) but
-            # free text is now allowed too — moderation + rate limiting
-            # below still apply to every message either way.
-
+            # Pre-verification templates are offered as quick-reply suggestions
+            # (see GET /chat/{thread_id}/templates) but are no longer the ONLY
+            # thing a party can send — free text is allowed too, both before
+            # and after verification. Moderation below still applies to both.
             if current["status"] not in ("chat", "verified"):
                 await websocket.send_json(
                     {"type": "error", "message": "Messages are not allowed in the current chat phase."}
@@ -520,16 +578,6 @@ async def chat_ws(websocket: WebSocket, thread_id: str, email: str = Query(...))
                     {"type": "moderation_notice", "tier": "nudge", "message": TIER_RESPONSES["nudge"]}
                 )
     except WebSocketDisconnect:
-        pass
-    except Exception:
-        # A dropped connection can surface as something other than a clean
-        # WebSocketDisconnect (network loss, app backgrounded/killed, proxy
-        # timeout). Previously only WebSocketDisconnect triggered cleanup,
-        # so those cases left a stale entry in the registry and the other
-        # participant kept seeing "online" forever. Catch broadly here and
-        # always clean up in `finally` below instead.
-        logger.exception("Unexpected error in chat websocket for thread %s", thread_id)
-    finally:
         disconnected_email = manager.disconnect(thread_id, websocket)
         if disconnected_email:
             await manager.broadcast(thread_id, {

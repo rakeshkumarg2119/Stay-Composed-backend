@@ -12,6 +12,7 @@ never raised, so a notification bug can't take down the request that
 triggered it (item creation, chat message, etc).
 """
 
+import asyncio
 import logging
 
 import firebase_admin
@@ -70,9 +71,12 @@ async def send_push(
 
     try:
         # firebase-admin's send() is synchronous (blocking HTTP under the
-        # hood) — fine at this app's message volume; move to a thread pool
-        # executor if this ever becomes a bottleneck under load.
-        messaging.send(message)
+        # hood). Called directly, this would block the whole event loop —
+        # i.e. stall every OTHER concurrent request on this server — for
+        # the duration of each push, not just the caller. Offloading to a
+        # thread keeps this async function honest about actually being
+        # non-blocking.
+        await asyncio.to_thread(messaging.send, message)
         return True
     except messaging.UnregisteredError:
         # Token is dead (app uninstalled, token rotated and old one never

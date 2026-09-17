@@ -2,13 +2,17 @@ import logging
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
 
 from app.config import get_settings
 from app.database import items_collection
 from app.models import CandidateMatch, ItemCreate, ItemOut, MineResponse
 from app.security import hash_secret, mask_display_name
 from app.services.clip_service import embed_image_url, embed_text
+from app.services.text_similarity_service import (
+    MODEL_VERSION as ANSWER_EMBEDDING_MODEL_VERSION,
+    embed_answer_text,
+)
 from app.services.email_service import send_match_found_email
 from app.services.matching import score_pair
 from app.services.push_service import send_push_to_email
@@ -42,7 +46,7 @@ def _to_out(doc: dict, include_secrets: bool = False) -> ItemOut:
 
 
 @router.post("", response_model=ItemOut)
-async def create_item(payload: ItemCreate):
+async def create_item(payload: ItemCreate, background_tasks: BackgroundTasks):
     loc_error = validate_location(payload.type, payload.location, payload.locationDetail)
     if loc_error:
         raise HTTPException(status_code=400, detail=loc_error)
@@ -83,6 +87,9 @@ async def create_item(payload: ItemCreate):
         "status": "open",
         "createdAt": datetime.now(timezone.utc),
         # CLIP embeddings, stored as plain lists so Mongo can serialize them
+        # (used for lost<->found item matching, NOT for challenge-answer
+        # verification — see secretAnswerEmbeddings below, which uses a
+        # different, dedicated text-similarity model)
         "textEmbedding": _safe_list(embed_text(text_blob)),
         "imageEmbedding": _safe_list(embed_image_url(payload.imageUrl)),
     }
@@ -96,10 +103,23 @@ async def create_item(payload: ItemCreate):
         clean_answers = [a.strip() for a in (payload.secretAnswers or []) if a.strip()]
         doc["challengeQuestions"] = clean_questions
         doc["secretAnswerHashes"] = [hash_secret(a) for a in clean_answers]
-        doc["secretAnswerEmbeddings"] = [_safe_list(embed_text(a)) for a in clean_answers]
+        # Dedicated sentence-similarity model (NOT clip_service's CLIP model)
+        # — CLIP text embeddings are anisotropic and unsuited to discriminating
+        # unrelated short phrases from genuine paraphrases; see
+        # text_similarity_service.py for the full rationale. The plaintext
+        # answers themselves are never stored (only the bcrypt hashes above),
+        # so this version tag is what lets claims.py tell whether it's safe
+        # to compare against these stored vectors if the model ever changes
+        # again later.
+        doc["secretAnswerEmbeddings"] = [_safe_list(embed_answer_text(a)) for a in clean_answers]
+        doc["secretAnswerEmbeddingModel"] = ANSWER_EMBEDDING_MODEL_VERSION
 
     await items_collection().insert_one(doc)
-    await _notify_new_matches(doc)
+    # Matching + notifying other users is not something the submitter is
+    # waiting on — it involves emailing/pushing every crossed-threshold
+    # match, which can take seconds and scales with DB size. Run it after
+    # the response is already on its way back instead of blocking on it.
+    background_tasks.add_task(_notify_new_matches, doc)
     return _to_out(doc, include_secrets=True)
 
 

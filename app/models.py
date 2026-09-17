@@ -100,6 +100,12 @@ class BloodAlertResult(BaseModel):
 # text both ways, but closes permanently once the founder starts verification.
 # ---------------------------------------------------------------------------
 
+class ChatTemplatesOut(BaseModel):
+    role: str
+    questions: list[str]
+    answers: list[str]
+    freeTextAllowed: bool
+
 class ChatThreadOut(BaseModel):
     threadId: str
     complaintId: str

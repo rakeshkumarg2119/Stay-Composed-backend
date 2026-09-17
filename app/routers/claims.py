@@ -7,9 +7,22 @@ from app.config import get_settings
 from app.database import chat_threads_collection, claims_collection, items_collection
 from app.models import ClaimRequest, ClaimResult
 from app.security import verify_secret
-from app.services.clip_service import cosine_similarity, embed_text
+from app.services.text_similarity_service import (
+    MODEL_VERSION as ANSWER_EMBEDDING_MODEL_VERSION,
+    cosine_similarity,
+    embed_answer_text,
+)
 
 router = APIRouter(prefix="/claims", tags=["claims"])
+
+# Calibrated for all-MiniLM-L6-v2 (see text_similarity_service.py), NOT the
+# old CLIP model's 0.68 — that threshold was measured against a text tower
+# that isn't discriminative for unrelated short phrases in the first place,
+# so it doesn't transfer. Unrelated pairs on MiniLM typically land ~0.0-0.3;
+# genuine paraphrases of a short factual answer land ~0.55+. Still worth
+# validating with your own known-wrong-answer pairs before trusting this in
+# production; tune from there rather than treating 0.60 as final.
+SEMANTIC_MATCH_THRESHOLD = 0.60
 
 
 @router.post("", response_model=ClaimResult)
@@ -61,6 +74,13 @@ async def submit_claim(payload: ClaimRequest):
 
     stored_hashes: list[str] = found.get("secretAnswerHashes", [])
     stored_embeddings: list[list[float]] = found.get("secretAnswerEmbeddings", [])
+    # Only trust the stored embeddings for Tier 2 if they were built with the
+    # model we're comparing against right now. The plaintext answer is never
+    # stored (only the bcrypt hash below), so there's no way to re-embed an
+    # older record after a model change — items registered before this field
+    # existed, or with an older model tag, fall back to Tier 1 (exact match)
+    # only, rather than silently comparing vectors from two different spaces.
+    embeddings_usable = found.get("secretAnswerEmbeddingModel") == ANSWER_EMBEDDING_MODEL_VERSION
     total_fields = len(stored_hashes)
     if total_fields == 0:
         raise HTTPException(status_code=400, detail="This found item has no verification challenge configured.")
@@ -81,15 +101,18 @@ async def submit_claim(payload: ClaimRequest):
             exact_matches += 1
             continue
 
-        # Tier 2: AI Semantic similarity check using CLIP embedding
-        # Protects claimant from being locked out due to phrasing / spelling variations
-        if i < len(stored_embeddings) and stored_embeddings[i]:
+        # Tier 2: AI Semantic similarity check using a dedicated sentence-
+        # embedding model (see text_similarity_service.py — deliberately NOT
+        # CLIP, whose text tower doesn't reliably separate unrelated short
+        # phrases from genuine paraphrases). Protects claimants from being
+        # locked out over phrasing/spelling variations, without letting
+        # wrong answers slide through on an uncalibrated threshold.
+        if embeddings_usable and i < len(stored_embeddings) and stored_embeddings[i]:
             try:
-                ans_emb = embed_text(clean_ans)
+                ans_emb = embed_answer_text(clean_ans)
                 stored_vec = np.array(stored_embeddings[i])
                 sim = cosine_similarity(ans_emb, stored_vec)
-                # Cosine similarity >= 0.68 represents strong semantic correspondence in CLIP text space
-                if sim is not None and sim >= 0.68:
+                if sim is not None and sim >= SEMANTIC_MATCH_THRESHOLD:
                     matched += 1
                     semantic_matches += 1
             except Exception:
