@@ -6,7 +6,7 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
 
 from app.config import get_settings
 from app.database import items_collection
-from app.models import CandidateMatch, ItemCreate, ItemOut, MineResponse
+from app.models import CandidateMatch, FounderCandidateMatch, ItemCreate, ItemOut, MineResponse
 from app.security import hash_secret, mask_display_name
 from app.services.clip_service import embed_image_url, embed_text
 from app.services.text_similarity_service import (
@@ -232,10 +232,11 @@ async def my_items(email: str = Query(...)):
     my_complaints_docs = [d async for d in coll.find({"type": "lost", "reporterEmail": email})]
     my_found_docs = [d async for d in coll.find({"type": "found", "reporterEmail": email})]
 
+    import numpy as np
+
     candidate_matches: list[CandidateMatch] = []
     if my_complaints_docs:
         all_found_docs = [d async for d in coll.find({"type": "found", "status": "open"})]
-        import numpy as np
 
         for lost in my_complaints_docs:
             if lost.get("status") in ("handed_over", "resolved"):
@@ -261,10 +262,46 @@ async def my_items(email: str = Query(...)):
 
     candidate_matches.sort(key=lambda m: m.confidence, reverse=True)
 
+    # Founder-side mirror of the loop above: previously this direction was
+    # never computed at all, so a founder had no in-app way to learn that
+    # someone's lost complaint matches something they found — only the
+    # one-time email from _notify_new_matches (fired once, at the *other*
+    # report's creation time) ever told them. This makes it show up on
+    # every /mine poll too, same as the claimant side, which is what
+    # NotificationContext needs to raise an in-app toast for founders.
+    founder_matches: list[FounderCandidateMatch] = []
+    if my_found_docs:
+        all_lost_docs = [d async for d in coll.find({"type": "lost", "status": "open"})]
+
+        for found in my_found_docs:
+            if found.get("status") in ("handed_over", "resolved"):
+                continue
+            found_scored = {
+                "category": found.get("category"),
+                "location": found.get("location"),
+                "_textEmbedding": np.array(found["textEmbedding"]) if found.get("textEmbedding") else None,
+                "_imageEmbedding": np.array(found["imageEmbedding"]) if found.get("imageEmbedding") else None,
+            }
+            for lost in all_lost_docs:
+                lost_scored = {
+                    "category": lost.get("category"),
+                    "location": lost.get("location"),
+                    "_textEmbedding": np.array(lost["textEmbedding"]) if lost.get("textEmbedding") else None,
+                    "_imageEmbedding": np.array(lost["imageEmbedding"]) if lost.get("imageEmbedding") else None,
+                }
+                confidence = score_pair(lost_scored, found_scored)
+                if confidence >= settings.match_min_confidence:
+                    founder_matches.append(
+                        FounderCandidateMatch(candidate=_to_out(lost, include_secrets=False), forFoundItemId=found["_id"], confidence=confidence)
+                    )
+
+    founder_matches.sort(key=lambda m: m.confidence, reverse=True)
+
     return MineResponse(
         myComplaints=[_to_out(d, include_secrets=True) for d in my_complaints_docs],
         myFoundItems=[_to_out(d, include_secrets=True) for d in my_found_docs],
         candidateMatches=candidate_matches,
+        founderMatches=founder_matches,
         chatConfidenceThreshold=settings.chat_min_confidence,
     )
 

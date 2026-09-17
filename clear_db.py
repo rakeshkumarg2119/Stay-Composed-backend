@@ -8,6 +8,7 @@ from app.database import (
     chat_threads_collection,
     chat_messages_collection,
     device_tokens_collection,
+    notifications_collection,
     ensure_indexes,
 )
 
@@ -38,7 +39,11 @@ async def clear_database(keep_staff: bool = False):
     res_tokens = await device_tokens_collection().delete_many({})
     print(f"[-] Deleted Device Push Tokens:          {res_tokens.deleted_count}")
 
-    # 6. Staff directory
+    # 6. Clear in-app notification feed (new collection — claims.py._notify writes here)
+    res_notifs = await notifications_collection().delete_many({})
+    print(f"[-] Deleted In-App Notifications:        {res_notifs.deleted_count}")
+
+    # 7. Staff directory
     if not keep_staff:
         res_staff = await staff_collection().delete_many({})
         print(f"[-] Deleted Staff Directory Entries:     {res_staff.deleted_count}")
@@ -46,3 +51,13 @@ async def clear_database(keep_staff: bool = False):
         print("[*] Kept Staff Directory Entries intact.")
 
     # Re-apply indexes cleanly
+    await ensure_indexes()
+    print("[+] Indexes re-applied.")
+    print("=" * 60)
+    print("  Cleanup complete.")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    keep_staff_flag = "--keep-staff" in sys.argv
+    asyncio.run(clear_database(keep_staff=keep_staff_flag))

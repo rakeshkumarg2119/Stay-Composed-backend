@@ -51,10 +51,26 @@ class CandidateMatch(BaseModel):
     confidence: int
 
 
+class FounderCandidateMatch(BaseModel):
+    """
+    The founder-side mirror of CandidateMatch: a lost complaint (candidate)
+    that matches one of the current user's *found* items. Without this,
+    /items/mine only ever surfaced matches for the current user's lost
+    complaints, so a founder never saw an in-app "someone lost something
+    matching your found item" notice — only the backend's separate email
+    ever told them (see items.py::_notify_new_matches, which is the only
+    place both directions were previously covered).
+    """
+    candidate: ItemOut
+    forFoundItemId: str
+    confidence: int
+
+
 class MineResponse(BaseModel):
     myComplaints: list[ItemOut]
     myFoundItems: list[ItemOut]
     candidateMatches: list[CandidateMatch]
+    founderMatches: list[FounderCandidateMatch] = []
     chatConfidenceThreshold: int
 
 
@@ -149,3 +165,20 @@ class DeviceTokenRegister(BaseModel):
     email: EmailStr
     token: str = Field(min_length=10)
     platform: Literal["android", "ios"] = "android"
+
+
+# ---------------------------------------------------------------------------
+# In-app notifications feed. `type` is snake_case on the wire — the Flutter
+# side's NotificationsController._parseType() converts snake_case ->
+# camelCase to match the NotificationType enum, so every producer (claims.py
+# etc.) must emit snake_case here too.
+# ---------------------------------------------------------------------------
+
+class NotificationOut(BaseModel):
+    id: str
+    type: str
+    title: str
+    body: str
+    createdAt: datetime
+    isRead: bool = False
+    relatedId: Optional[str] = None

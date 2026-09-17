@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 import numpy as np
 from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketDisconnect
+from pymongo.errors import DuplicateKeyError
 
 from app.config import get_settings
 from app.database import chat_messages_collection, chat_threads_collection, items_collection
@@ -303,7 +304,19 @@ async def get_or_create_thread(payload: ChatThreadRequest):
         "verificationStartedAt": None,
         "heldMessageCount": 0,
     }
-    await chat_threads_collection().insert_one(doc)
+    try:
+        await chat_threads_collection().insert_one(doc)
+    except DuplicateKeyError:
+        # Two near-simultaneous requests for the same pair (React 18 /
+        # Next.js dev-mode StrictMode double-invokes effects, so ChatPanel's
+        # setup() can genuinely fire twice) can both pass the `existing`
+        # check above before either has inserted. The loser here isn't a
+        # real failure — the thread now exists, just insert this one
+        # created it. Return the winner's doc instead of 500ing.
+        winner = await chat_threads_collection().find_one({"_id": thread_id})
+        if winner:
+            return ChatThreadOut(threadId=thread_id, **{k: v for k, v in winner.items() if k != "_id"})
+        raise
 
     # NOTE: no email here on purpose. A thread only ever gets created once
     # confidence >= chat_min_confidence — the exact same threshold

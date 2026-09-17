@@ -24,12 +24,12 @@ class Settings(BaseSettings):
 
     # Matching / verification
     match_min_confidence: int = 40
-    claim_max_attempts: int = 5
+    claim_max_attempts: int = 3
     claim_cooldown_minutes: int = 30
     claim_timeout_hours: int = 48
 
     # Chat — unlocks on AI match (50%+ allows text/category/location match even without claimant photo)
-    chat_min_confidence: int = 50
+    chat_min_confidence: int = 40
     chat_max_messages_per_minute: int = 20
     chat_message_max_length: int = 1000
 

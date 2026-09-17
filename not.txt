@@ -64,11 +64,11 @@ The response now contains this top-level field:
 
 Exact field name: `chatConfidenceThreshold`.
 
-Its value is the configured `CHAT_MIN_CONFIDENCE` value. The default is `50`.
+Its value is the configured `CHAT_MIN_CONFIDENCE` value. The default is `40`.
 
 POST /chat/thread confidence rejection
 
-Yes. The route calculates match confidence and rejects a request below `chatConfidenceThreshold` (`CHAT_MIN_CONFIDENCE`, default `50`). FastAPI returns HTTP `403` with this JSON shape:
+Yes. The route calculates match confidence and rejects a request below `chatConfidenceThreshold` (`CHAT_MIN_CONFIDENCE`, default `40`). FastAPI returns HTTP `403` with this JSON shape:
 
 ```json
 {

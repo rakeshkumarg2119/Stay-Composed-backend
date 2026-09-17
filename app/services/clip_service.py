@@ -11,6 +11,7 @@ The model is lazy-loaded once per process (first request pays the cost).
 
 import io
 import logging
+import time
 from functools import lru_cache
 
 import os
@@ -55,16 +56,29 @@ def embed_text(text: str) -> np.ndarray | None:
     return vec
 
 
-def embed_image_url(image_url: str | None) -> np.ndarray | None:
+def embed_image_url(image_url: str | None, retries: int = 3, backoff_seconds: float = 1.5) -> np.ndarray | None:
     if not image_url:
         return None
-    try:
-        resp = requests.get(image_url, timeout=10)
-        resp.raise_for_status()
-        img = Image.open(io.BytesIO(resp.content)).convert("RGB")
-    except Exception:
-        logger.warning("Could not fetch/decode image for embedding: %s", image_url)
-        return None
+
+    img = None
+    for attempt in range(1, retries + 1):
+        try:
+            resp = requests.get(image_url, timeout=10)
+            resp.raise_for_status()
+            img = Image.open(io.BytesIO(resp.content)).convert("RGB")
+            break
+        except Exception:
+            # Most common cause: this runs right after the file was
+            # uploaded to Cloudinary, and the CDN hasn't finished
+            # propagating the asset yet, so the very next fetch 404s or
+            # times out. Retrying with a short backoff avoids permanently
+            # baking a missing imageEmbedding (and losing up to 35 of 98
+            # match-score points, more than the chat gate itself) into the
+            # stored item over what's usually a sub-5-second timing gap.
+            if attempt == retries:
+                logger.warning("Could not fetch/decode image for embedding after %d attempts: %s", retries, image_url)
+                return None
+            time.sleep(backoff_seconds * attempt)
 
     model = _get_model()
     vec = model.encode([img], convert_to_numpy=True, normalize_embeddings=True)[0]

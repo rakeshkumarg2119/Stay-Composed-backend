@@ -49,6 +49,18 @@ def device_tokens_collection():
     return get_db()["device_tokens"]
 
 
+def notifications_collection():
+    """
+    In-app notification feed, distinct from the push itself — a push can
+    fail to deliver (app killed, no network, permission denied) or arrive
+    while the phone is offline, but the record here still shows up next
+    time the user opens the Notifications screen. Every write here should
+    be paired with a send_push_to_email call at the same call site (see
+    claims.py::_notify) so the two never drift apart again.
+    """
+    return get_db()["notifications"]
+
+
 async def ensure_indexes() -> None:
     db = get_db()
     await db["items"].create_index([("type", 1), ("reporterEmail", 1)])
@@ -60,3 +72,4 @@ async def ensure_indexes() -> None:
     await db["chat_messages"].create_index([("senderEmail", 1), ("sentAt", 1)])
     await db["device_tokens"].create_index("token", unique=True)
     await db["device_tokens"].create_index("email")
+    await db["notifications"].create_index([("email", 1), ("createdAt", -1)])
