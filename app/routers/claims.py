@@ -4,10 +4,14 @@ import numpy as np
 from fastapi import APIRouter, HTTPException
 
 from app.config import get_settings
-from app.database import chat_threads_collection, claims_collection, items_collection, notifications_collection
+from app.database import chat_threads_collection, claims_collection, items_collection
 from app.models import ClaimRequest, ClaimResult
 from app.security import verify_secret
-from app.services.push_service import send_push_to_email
+from app.services.notification_service import (
+    TYPE_VERIFICATION_COMPLETED,
+    TYPE_VERIFICATION_FAILED,
+    notify,
+)
 from app.services.text_similarity_service import (
     MODEL_VERSION as ANSWER_EMBEDDING_MODEL_VERSION,
     cosine_similarity,
@@ -17,43 +21,13 @@ from app.services.text_similarity_service import (
 router = APIRouter(prefix="/claims", tags=["claims"])
 
 
-async def _notify(email: str, *, type_: str, title: str, body: str, related_id: str) -> None:
-    """
-    Writes the in-app notification record (what GET /notifications and the
-    Notifications screen actually read) AND fires the push, in one place,
-    so the two can never drift out of sync again. `type_` must be
-    snake_case — the Flutter side's _parseType() converts snake_case ->
-    camelCase to match NotificationType.
+# _notify() used to live here. It now lives in
+# app/services/notification_service.py as notify(), shared by items.py,
+# chat.py and blood_alert.py — those three were calling the push layer
+# directly and never writing the feed row, which is why the Notifications
+# screen only ever showed claim events (and even those parsed as the
+# wrong type client-side).
 
-    ASSUMPTION: field names/shape here match whatever the existing
-    GET /notifications route already returns (id, type, title, body,
-    createdAt, isRead, relatedId — per notifications_provider.dart). If
-    that route lives elsewhere and expects different field names, adjust
-    this insert to match it exactly, or the notification will be written
-    but silently fail to parse client-side.
-    """
-    doc = {
-        "email": email,
-        "type": type_,
-        "title": title,
-        "body": body,
-        "createdAt": datetime.now(timezone.utc),
-        "isRead": False,
-        "relatedId": related_id,
-    }
-    await notifications_collection().insert_one(doc)
-    # Push failure must never break the claim response — send_push_to_email
-    # already fails soft internally, but keep this belt-and-braces in case
-    # that contract changes later.
-    try:
-        await send_push_to_email(
-            email,
-            title=title,
-            body=body,
-            data={"type": type_, "relatedId": related_id},
-        )
-    except Exception:
-        pass
 
 # Calibrated for all-MiniLM-L6-v2 (see text_similarity_service.py), NOT the
 # old CLIP model's 0.68 — that threshold was measured against a text tower
@@ -195,9 +169,9 @@ async def submit_claim(payload: ClaimRequest):
         # screen open right now — this is what actually reaches the
         # founder if the app is backgrounded or closed.
         if founder_email:
-            await _notify(
+            await notify(
                 founder_email,
-                type_="verification_completed",
+                type_=TYPE_VERIFICATION_COMPLETED,
                 title="Ownership verified",
                 body=f"{payload.claimantEmail} verified their claim on your found item. Coordinate handover in chat.",
                 related_id=thread_id,
@@ -206,9 +180,9 @@ async def submit_claim(payload: ClaimRequest):
         message = f"Verification failed — only {matched} of {total_fields} secret detail(s) matched. Try again or contact admin support."
 
         if founder_email:
-            await _notify(
+            await notify(
                 founder_email,
-                type_="verification_failed",
+                type_=TYPE_VERIFICATION_FAILED,
                 title="Claim attempt failed",
                 body=f"{payload.claimantEmail} attempted to verify ownership but only matched {matched} of {total_fields} details.",
                 related_id=thread_id,

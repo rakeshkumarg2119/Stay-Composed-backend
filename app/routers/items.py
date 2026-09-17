@@ -15,7 +15,7 @@ from app.services.text_similarity_service import (
 )
 from app.services.email_service import send_match_found_email
 from app.services.matching import score_pair
-from app.services.push_service import send_push_to_email
+from app.services.notification_service import TYPE_MATCH_FOUND, notify
 from app.utils.locations import format_location, validate_location
 
 logger = logging.getLogger("items")
@@ -144,10 +144,17 @@ async def _notify_new_matches(new_doc: dict) -> None:
     open item of the opposite type and emails both parties on any pair
     crossing chat_min_confidence (same threshold that unlocks chat).
 
-    Deliberately email-only for now: there's no FCM push infra in this
-    backend yet (no device-token storage, no firebase-admin dependency
-    confirmed, no registration endpoint) — that's a separate build, not a
-    one-line hook like this one.
+    Both parties get an email AND a notify() call. notify() is what writes
+    the durable in-app feed row — the previous version called
+    send_push_to_email directly here, which meant a match-found event
+    showed as a phone banner and then vanished, never appearing on the
+    Notifications screen.
+
+    Note this fires exactly once per pair, at insert time of the
+    later-created item. Re-testing against items already in the database
+    will NOT re-fire it — use fresh reports when verifying notification
+    behaviour, or the absence of a notification will look like a
+    regression when it is just a consumed one-shot event.
 
     Failures here are logged, never raised — a broken notification must
     never fail the actual item report.
@@ -195,33 +202,36 @@ async def _notify_new_matches(new_doc: dict) -> None:
         except Exception:
             logger.exception("Failed sending match-found emails for %s <-> %s", lost_doc["_id"], found_doc["_id"])
 
+        # notify() = feed row + push, in that order. Do NOT replace these
+        # with bare send_push_to_email calls again; that is what left the
+        # Notifications screen permanently empty for match events.
         try:
-            await send_push_to_email(
+            await notify(
                 lost_doc["reporterEmail"],
+                type_=TYPE_MATCH_FOUND,
                 title="Possible match found",
                 body=f"A found item may match your lost report: {found_doc['title']}",
-                data={
-                    "type": "match_found",
-                    "relatedId": lost_doc["_id"],
+                related_id=lost_doc["_id"],
+                extra={
                     "complaintId": lost_doc["_id"],
                     "foundItemId": found_doc["_id"],
                     "confidence": str(confidence),
                 },
             )
-            await send_push_to_email(
+            await notify(
                 found_doc["reporterEmail"],
+                type_=TYPE_MATCH_FOUND,
                 title="Possible match found",
                 body=f"Your found item may match a lost report: {lost_doc['title']}",
-                data={
-                    "type": "match_found",
-                    "relatedId": found_doc["_id"],
+                related_id=found_doc["_id"],
+                extra={
                     "complaintId": lost_doc["_id"],
                     "foundItemId": found_doc["_id"],
                     "confidence": str(confidence),
                 },
             )
         except Exception:
-            logger.exception("Failed sending match-found push for %s <-> %s", lost_doc["_id"], found_doc["_id"])
+            logger.exception("Failed notifying match-found for %s <-> %s", lost_doc["_id"], found_doc["_id"])
 
 
 @router.get("/mine", response_model=MineResponse)

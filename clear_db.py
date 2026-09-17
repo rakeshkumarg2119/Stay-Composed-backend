@@ -7,7 +7,6 @@ from app.database import (
     blood_alerts_collection,
     chat_threads_collection,
     chat_messages_collection,
-    device_tokens_collection,
     notifications_collection,
     ensure_indexes,
 )
@@ -35,15 +34,17 @@ async def clear_database(keep_staff: bool = False):
     res_blood = await blood_alerts_collection().delete_many({})
     print(f"[-] Deleted Blood Alerts:                {res_blood.deleted_count}")
 
-    # 5. Clear device push notification tokens
-    res_tokens = await device_tokens_collection().delete_many({})
-    print(f"[-] Deleted Device Push Tokens:          {res_tokens.deleted_count}")
+    # NOTE: Device push tokens (device_tokens_collection) are deliberately
+    # NOT touched here. They're infrastructure state — which physical
+    # device belongs to which user — not lost-and-found app data, and
+    # wiping them broke push notifications for every user until they
+    # force-closed/reinstalled the app to re-register. See incident notes.
 
-    # 6. Clear in-app notification feed (new collection — claims.py._notify writes here)
+    # 5. Clear in-app notification feed (new collection — claims.py._notify writes here)
     res_notifs = await notifications_collection().delete_many({})
     print(f"[-] Deleted In-App Notifications:        {res_notifs.deleted_count}")
 
-    # 7. Staff directory
+    # 6. Staff directory
     if not keep_staff:
         res_staff = await staff_collection().delete_many({})
         print(f"[-] Deleted Staff Directory Entries:     {res_staff.deleted_count}")

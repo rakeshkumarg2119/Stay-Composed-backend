@@ -13,7 +13,7 @@ from app.models import ChatMessageOut, ChatTemplatesOut, ChatThreadOut, ChatThre
 from app.security import sanitize_chat_text
 from app.services.matching import score_pair
 from app.services.moderation import TIER_RESPONSES, classify_message
-from app.services.push_service import send_push_to_email
+from app.services.notification_service import TYPE_CHAT_MESSAGE, TYPE_CHAT_OPENED, notify
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
@@ -332,19 +332,19 @@ async def get_or_create_thread(payload: ChatThreadRequest):
     # genuinely distinct, timely signal that the match email doesn't
     # carry — the match email could be from days ago.
     try:
-        await send_push_to_email(
+        await notify(
             founder_email,
+            type_=TYPE_CHAT_OPENED,
             title="Someone wants to chat about your found item",
             body=f"A claimant started a chat about: {found['title']}",
-            data={
-                "type": "chat_opened",
-                "relatedId": thread_id,
+            related_id=thread_id,
+            extra={
                 "complaintId": payload.complaintId,
                 "foundItemId": payload.foundItemId,
             },
         )
     except Exception:
-        logger.exception("Failed sending founder chat-opened push for thread %s", thread_id)
+        logger.exception("Failed notifying founder of chat-opened for thread %s", thread_id)
 
     return ChatThreadOut(threadId=thread_id, **{k: v for k, v in doc.items() if k != "_id"})
 
@@ -577,14 +577,15 @@ async def chat_ws(websocket: WebSocket, thread_id: str, email: str = Query(...))
             if not manager.is_online(thread_id, recipient):
                 try:
                     sender_name = current.get("claimantName") if email == current["claimantEmail"] else current.get("founderName")
-                    await send_push_to_email(
+                    await notify(
                         recipient,
+                        type_=TYPE_CHAT_MESSAGE,
                         title=sender_name or email,
                         body=text[:120],
-                        data={"type": "chat_message", "relatedId": thread_id},
+                        related_id=thread_id,
                     )
                 except Exception:
-                    logger.exception("Failed sending chat push for thread %s", thread_id)
+                    logger.exception("Failed notifying chat message for thread %s", thread_id)
 
             if tier == "nudge":
                 await websocket.send_json(

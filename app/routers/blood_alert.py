@@ -5,6 +5,7 @@ from fastapi import APIRouter, HTTPException, Query
 from app.database import blood_alerts_collection, staff_collection
 from app.models import BloodAlertRequest, BloodAlertResult
 from app.services.email_service import send_blood_alert
+from app.services.notification_service import TYPE_BLOOD_REQUEST_CREATED, notify
 
 router = APIRouter(prefix="/blood-alert", tags=["blood-alert"])
 
@@ -42,7 +43,7 @@ async def create_blood_alert(payload: BloodAlertRequest):
         sender_email=payload.senderEmail,
     )
 
-    await blood_alerts_collection().insert_one(
+    result = await blood_alerts_collection().insert_one(
         {
             "studentName": payload.studentName,
             "bloodType": payload.bloodType,
@@ -52,6 +53,18 @@ async def create_blood_alert(payload: BloodAlertRequest):
             "scope": "campus-wide-all-departments",
             "createdAt": datetime.now(timezone.utc),
         }
+    )
+
+    # Feed row for the sender so the broadcast shows up in their in-app
+    # history, not just as an outbound email they can't see. notify() also
+    # pushes, which is a useful "your alert went out to N people"
+    # confirmation on a screen they may have already navigated away from.
+    await notify(
+        payload.senderEmail,
+        type_=TYPE_BLOOD_REQUEST_CREATED,
+        title="Blood alert broadcast sent",
+        body=f"Your {payload.bloodType} request for {payload.studentName} reached {sent_count} staff member(s).",
+        related_id=str(result.inserted_id),
     )
 
     return BloodAlertResult(
